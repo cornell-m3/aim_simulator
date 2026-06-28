@@ -1,0 +1,34 @@
+# Mid-trace ISR_SYNC barrier.
+#
+# Phase 1: some independent per-channel work on ch=0 and ch=1.
+# Phase 2: ISR_SYNC (drains all channels via a 32-way blocking barrier).
+# Phase 3: more work on ch=0 and ch=1 (must wait for SYNC to complete).
+# Phase 4: ISR_EOC (frontend's "trace done" hook).
+#
+# Validates that:
+#   - ISR_SYNC's per-channel blocking aim_reqs all complete
+#   - the dispatcher resumes after SYNC clears all stalls
+#   - phase-3 work runs to completion
+#   - ISR_EOC still fires its frontend callback at the end
+
+# Phase 1
+AiM WR_BIAS 4 0x00000001
+AiM MAC_ABK 63 0x00000001 0
+AiM RD_MAC 4 0x00000001
+AiM WR_BIAS 4 0x00000002
+AiM MAC_ABK 63 0x00000002 0
+AiM RD_MAC 4 0x00000002
+
+# Phase 2: barrier
+AiM ISR_SYNC
+
+# Phase 3
+AiM WR_BIAS 4 0x00000001
+AiM MAC_ABK 63 0x00000001 1
+AiM RD_MAC 4 0x00000001
+AiM WR_BIAS 4 0x00000002
+AiM MAC_ABK 63 0x00000002 1
+AiM RD_MAC 4 0x00000002
+
+# Phase 4
+AiM ISR_EOC

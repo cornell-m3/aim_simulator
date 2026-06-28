@@ -34,7 +34,25 @@ while [[ $# -gt 0 ]]; do
 done
 
 STARTING_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
-trap 'git checkout "$STARTING_BRANCH" >/dev/null 2>&1 || true' EXIT
+
+# Stash the goldens dir to a tempdir before we start switching branches; the
+# goldens are only committed on the cleanup branch and would vanish from disk
+# after `git checkout experiments-design-A`. We read from / write to the stash
+# throughout, and copy back at exit.
+GOLDEN_STASH="$(mktemp -d)"
+if [[ -d test/golden ]]; then
+    cp -r test/golden/* "$GOLDEN_STASH/" 2>/dev/null || true
+fi
+
+cleanup() {
+    git checkout "$STARTING_BRANCH" >/dev/null 2>&1 || true
+    if [[ "$UPDATE" -eq 1 ]]; then
+        mkdir -p test/golden
+        cp -r "$GOLDEN_STASH/"* test/golden/ 2>/dev/null || true
+    fi
+    rm -rf "$GOLDEN_STASH"
+}
+trap cleanup EXIT
 
 BRANCHES=(A B C D D-cleanup)
 TRACES=(uni_1 uni_2 uni_4 uni_8 uni_16 uni_32 sync_mid)
@@ -53,13 +71,13 @@ for letter in "${BRANCHES[@]}"; do
     git checkout "$branch" >/dev/null
     (cd build && make -j8 >/dev/null 2>&1)
 
-    mkdir -p "test/golden/${branch}"
+    mkdir -p "${GOLDEN_STASH}/${branch}"
     for trace in "${TRACES[@]}"; do
         trace_file="test/${trace}.trace"
         if [[ ! -f "$trace_file" ]]; then
             echo "  skip ${trace} (no file)"; continue
         fi
-        golden="test/golden/${branch}/${trace}.txt"
+        golden="${GOLDEN_STASH}/${branch}/${trace}.txt"
         actual="$(timeout 120 ./build/ramulator2 -f test/example.yaml -t "$trace_file" 2>&1 \
                   | grep -E "$STAT_REGEX" | sed -E 's/[[:space:]]+#.*$//' | sort)"
         if [[ "$UPDATE" -eq 1 ]]; then

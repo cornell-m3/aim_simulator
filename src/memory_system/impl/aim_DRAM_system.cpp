@@ -16,26 +16,34 @@ namespace Ramulator {
 #define ISR_SIZE (1 << 21)
 #define MAX_CHANNEL_COUNT 32
 
-// Design B: per-channel pipelines with a phase-structured tick().
+// Design D: design B's per-channel pipeline + design C's required-channels
+// FIFO join. The cleanest of the four implementations on both axes:
+//
+//   - send path:  one (drain is the only place that calls controller->send)
+//   - join model: per-host required_channels mask + per-channel high-water
+//                 mark (last_completed_host_id), so multiple in-flight host
+//                 callbacks at different host_req_ids are handled naturally
 //
 // tick() has three phases:
 //   1. decompose: pop one host_req from host_request_queue and split it into
-//      per-channel aim_reqs. aim_reqs go straight into channel_pending_queues —
-//      decompose never calls controller->send().
+//      per-channel aim_reqs. aim_reqs go straight into channel_pending_queues
+//      — decompose never calls controller->send().
 //   2. drain: for each channel, send aim_reqs from channel_pending_queues[ch]
 //      to the controller until stalls[ch] becomes nonzero (blocking aim_req in
 //      flight) or the controller refuses. This is the ONLY send path.
 //   3. controllers tick.
 //
-// Decomposing before draining lets newly-queued aim_reqs ship to the controller
-// in the same tick they were decomposed (no extra latency for the trailing
-// host_req).
+// Host callbacks (e.g. ISR_EOC's frontend "trace done" hook) live in a FIFO of
+// PendingCallback{host_req, required_channels_mask}, pushed at decompose time.
+// Each blocking aim_req carries this->callback, so completions land in
+// receive(), which (a) decrements stalls[ch] and (b) advances
+// last_completed_host_id[ch] to the completing host_req's id. The FIFO is then
+// walked head-first: a callback fires once every channel in its required_channels
+// mask has caught up (last_completed_host_id[ch] >= pc.host_req.host_req_id).
 //
-// Blocking-completion callbacks (e.g. ISR_EOC's frontend "trace done" hook)
-// are stashed in pending_host_callbacks at decompose time and fired in
-// receive() once every channel reports stalls=0 AND its pending queue is
-// empty. The empty-queue clause closes a race where a freshly-decomposed but
-// unsent aim_req could otherwise be skipped at the barrier.
+// Race-free by construction: last_completed_host_id only advances from real
+// completions, so an unsent aim_req can never trip the barrier — no
+// empty-queue clause is needed (unlike design B's all-free barrier).
 class AiMDRAMSystem final : public IMemorySystem, public Implementation {
     RAMULATOR_REGISTER_IMPLEMENTATION(IMemorySystem, AiMDRAMSystem, "AiMDRAM", "AiM memory system (AiM DMA).");
 
@@ -57,9 +65,18 @@ protected:
     // stalls[ch] = number of in-flight blocking aim_reqs on channel ch.
     // A channel with stalls[ch] > 0 won't accept new sends until receive() fires.
     std::vector<int> stalls;
-    // Host requests whose callback should fire at the next all-free join
-    // (i.e. when every channel has stalls=0 and an empty pending queue).
-    std::vector<Request> pending_host_callbacks;
+    // High-water mark per channel: largest host_req_id whose blocking aim_req
+    // has completed on this channel. Advances only on receive(), so it can't
+    // race ahead of actual completions.
+    std::vector<int> last_completed_host_id;
+
+    // FIFO of host_reqs whose callback should fire once their required channels
+    // (bitmask) have all caught up to host_req_id. Order matches dispatch order.
+    struct PendingCallback {
+        Request host_req;
+        int64_t required_channels;
+    };
+    std::queue<PendingCallback> pending_callbacks;
 
     // Bound to receive(); used as the aim_req-completion callback by the controller.
     std::function<void(Request &)> callback;
@@ -159,6 +176,7 @@ public:
             controller->m_channel_id = i;
             m_controllers.push_back(controller);
             stalls.push_back(0);
+            last_completed_host_id.push_back(-1);
         }
 
         m_clock_ratio = param<uint>("clock_ratio").required();
@@ -247,9 +265,10 @@ public:
 
     // Split a host_req into per-channel aim_reqs and push each onto the
     // appropriate channel_pending_queues[ch]. Never calls controller->send().
-    // If the host_req has a callback (the frontend sets this on ISR_EOC), the
-    // host_req is also pushed to pending_host_callbacks so the all-free barrier
-    // in receive() can fire it once every channel finishes.
+    // If the host_req has a callback (the frontend sets this on ISR_EOC), a
+    // PendingCallback is enqueued with required_channels = host_req.channel_mask
+    // (or all channels for ISR_SYNC / ISR_EOC) so the barrier in receive() can
+    // fire it once every required channel has completed up to this host_req_id.
     void decompose(Request host_req) {
         switch (host_req.type) {
         case Type::AIM: {
@@ -288,7 +307,7 @@ public:
                 if (aim_ISR.AiM_DMA_blocking) {
                     aim_req.callback = callback;
                     if (host_req.callback)
-                        pending_host_callbacks.push_back(host_req);
+                        pending_callbacks.push({host_req, ch_mask});
                 }
 
                 if (aim_ISR.channel_count_eq_one && channel_count != 1) {
@@ -337,8 +356,10 @@ public:
             case Opcode::ISR_SYNC:
             case Opcode::ISR_EOC: {
                 aim_req.callback = callback;
-                if (host_req.callback)
-                    pending_host_callbacks.push_back(host_req);
+                if (host_req.callback) {
+                    int64_t all_ch_mask = (m_controllers.size() >= 32) ? -1LL : ((1LL << m_controllers.size()) - 1);
+                    pending_callbacks.push({host_req, all_ch_mask});
+                }
                 for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
                     aim_req.AiM_req_id = AiM_req_id++;
                     aim_req.host_req_id = host_req.host_req_id;
@@ -432,30 +453,37 @@ public:
     };
 
     // Invoked by the controller when an aim_req with this->callback set completes.
-    // Clears the channel's stall and, if every channel is fully drained (no stalls
-    // and no queued aim_reqs), fires any host callbacks waiting on the join.
+    // Clears the channel's stall, advances last_completed_host_id[ch] to the
+    // completing host_req's id, and walks the pending_callbacks FIFO firing
+    // anything whose required channels have caught up.
     void receive(Request &req) {
         int channel_id = req.addr_vec[m_dram->m_levels("channel")];
         stalls[channel_id]--;
 
-        // All-free join: every channel must have stalls=0 AND an empty pending
-        // queue. The empty-queue clause is what makes the barrier race-free —
-        // without it, a freshly-decomposed aim_req sitting in the channel queue
-        // could be skipped because its own stall hasn't been bumped yet.
-        bool all_free = true;
-        for (int ch = 0; ch < (int)m_controllers.size(); ch++) {
-            if (stalls[ch] != 0 || !channel_pending_queues[ch].empty()) {
-                all_free = false;
-                break;
-            }
-        }
+        if (req.host_req_id > last_completed_host_id[channel_id])
+            last_completed_host_id[channel_id] = req.host_req_id;
 
-        if (all_free && !pending_host_callbacks.empty()) {
-            for (auto &h : pending_host_callbacks) {
-                if (h.callback)
-                    h.callback(h);
+        // Walk pending callbacks in FIFO order. A callback fires once every
+        // channel in its required_channels mask has caught up to its host_req_id.
+        // This barrier is race-free by construction: last_completed_host_id only
+        // advances from real completions, so an unsent aim_req can never trip it.
+        while (!pending_callbacks.empty()) {
+            PendingCallback &pc = pending_callbacks.front();
+            bool all_caught_up = true;
+            int64_t mask = pc.required_channels;
+            for (int ch = 0; ch < (int)m_controllers.size(); ch++) {
+                if (mask & (1LL << ch)) {
+                    if (last_completed_host_id[ch] < pc.host_req.host_req_id) {
+                        all_caught_up = false;
+                        break;
+                    }
+                }
             }
-            pending_host_callbacks.clear();
+            if (!all_caught_up) break;
+            Request host_req = pc.host_req;
+            pending_callbacks.pop();
+            if (host_req.callback)
+                host_req.callback(host_req);
         }
     }
 

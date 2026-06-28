@@ -18,12 +18,13 @@ cd "$REPO_ROOT"
 
 STARTING_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 
-# 0a413a6 (the baseline) predates the uni_N traces, so we stash them into a
-# scratch dir and feed the binary their absolute paths. That keeps all branches
-# on the same uni_N corpus without committing trace files onto historical refs.
+# 0a413a6 (the baseline) predates the uni_N / bcast_N traces, so we stash them
+# into a scratch dir and feed the binary their absolute paths. That keeps all
+# branches on the same trace corpus without committing onto historical refs.
 TRACE_SCRATCH="$(mktemp -d)"
 for n in 1 2 4 8 16 32; do
     cp "test/uni_${n}.trace" "$TRACE_SCRATCH/"
+    cp "test/bcast_${n}.trace" "$TRACE_SCRATCH/"
 done
 
 cleanup() {
@@ -49,24 +50,33 @@ run_one() {
         | grep memory_system_cycles | awk '{print $2}'
 }
 
-# Header
-printf "| Branch                   |"
-for n in "${NS[@]}"; do printf " N=%-4d|" "$n"; done
-printf "\n"
-printf '|--------------------------|'
-for _ in "${NS[@]}"; do printf '%s' "-------|"; done
-printf "\n"
-
-for entry in "${REFS[@]}"; do
-    ref="${entry%%:*}"
-    name="${entry#*:}"
-    git checkout "$ref" >/dev/null 2>&1
-    (cd build && make -j8 >/dev/null 2>&1)
-    printf "| %-24s |" "$name"
-    for n in "${NS[@]}"; do
-        trace="${TRACE_SCRATCH}/uni_${n}.trace"
-        cycles=$(run_one "$trace")
-        printf " %-6s|" "$cycles"
-    done
+print_table() {
+    local family=$1   # "uni" or "bcast"
+    echo
+    echo "### ${family}_N (channel_mask = bits 0..N-1 in $( [[ $family = uni ]] && echo 'one-channel-per-host_req' || echo 'one-host_req-per-N-channels' ))"
+    echo
+    # Header
+    printf "| Branch                   |"
+    for n in "${NS[@]}"; do printf " N=%-4d|" "$n"; done
     printf "\n"
-done
+    printf '|--------------------------|'
+    for _ in "${NS[@]}"; do printf '%s' "-------|"; done
+    printf "\n"
+
+    for entry in "${REFS[@]}"; do
+        ref="${entry%%:*}"
+        name="${entry#*:}"
+        git checkout "$ref" >/dev/null 2>&1
+        (cd build && make -j8 >/dev/null 2>&1)
+        printf "| %-24s |" "$name"
+        for n in "${NS[@]}"; do
+            trace="${TRACE_SCRATCH}/${family}_${n}.trace"
+            cycles=$(run_one "$trace")
+            printf " %-6s|" "$cycles"
+        done
+        printf "\n"
+    done
+}
+
+print_table uni
+print_table bcast

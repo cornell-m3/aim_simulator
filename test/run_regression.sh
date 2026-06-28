@@ -55,7 +55,9 @@ cleanup() {
 trap cleanup EXIT
 
 BRANCHES=(A B C D D-cleanup)
-TRACES=(uni_1 uni_2 uni_4 uni_8 uni_16 uni_32 sync_mid)
+TRACES=(uni_1 uni_2 uni_4 uni_8 uni_16 uni_32
+        bcast_1 bcast_2 bcast_4 bcast_8 bcast_16 bcast_32
+        sync_mid)
 
 # Stat keys to capture. Cheap grep filter; anything matching the regex below
 # from the stdout of ramulator2 ends up in the golden.

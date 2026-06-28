@@ -32,6 +32,7 @@ protected:
     int AiM_req_id = 0;
 
     int stalled_AiM_requests = 0;
+    std::vector<int> stalls;
 
     std::function<void(Request &)> callback;
 
@@ -129,6 +130,7 @@ public:
             controller->m_impl->set_id(fmt::format("Channel {}", i));
             controller->m_channel_id = i;
             m_controllers.push_back(controller);
+            stalls.push_back(0);
         }
 
         m_clock_ratio = param<uint>("clock_ratio").required();
@@ -214,7 +216,7 @@ public:
             while (remaining_AiM_requests[channel_id].empty() == false) {
                 was_AiM_request_remaining = true;
                 // m_logger->info("[CLK {}] 0- Sending {} to channel {}", m_clk, remaining_AiM_requests[channel_id].front().str(), channel_id);
-                if (m_controllers[channel_id]->send(remaining_AiM_requests[channel_id].front()) == false) {
+                if (stalls[channel_id] || m_controllers[channel_id]->send(remaining_AiM_requests[channel_id].front()) == false) {
                     // m_logger->info("[CLK {}] 0- failed", m_clk, channel_id);
                     is_AiM_request_remaining = true;
                     break;
@@ -223,12 +225,8 @@ public:
             }
         }
 
-        if (stalled_AiM_requests == 0) {
             if (was_AiM_request_remaining == true) {
                 if (is_AiM_request_remaining == false) {
-                    Request host_req = request_queue.front();
-                    if (host_req.callback)
-                        host_req.callback(host_req);
                     request_queue.pop();
                 }
             } else if (request_queue.empty() == false) {
@@ -322,14 +320,13 @@ public:
                                 // m_logger->info("[CLK {}] 1- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
                                 assert(channel_id < m_controllers.size());
                                 assert(channel_id < MAX_CHANNEL_COUNT);
-                                if (m_controllers[channel_id]->send(aim_req) == false) {
+                                if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
                                     remaining_AiM_requests[channel_id].push(aim_req);
                                     all_AiM_requests_sent = false;
                                     // m_logger->info("[CLK {}] 1- failed", aim_req.str(), m_clk, channel_id);
                                 }
-
-                                if (aim_ISR.AiM_DMA_blocking) {
-                                    stalled_AiM_requests += 1;
+                                else if (aim_ISR.AiM_DMA_blocking) {
+                                    stalls[channel_id] += 1;
                                 }
                             }
                         }
@@ -353,11 +350,13 @@ public:
                             aim_req.AiM_req_id = AiM_req_id++;
                             aim_req.host_req_id = host_req.host_req_id;
                             // m_logger->info("[CLK {}] 2- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
-                            if (m_controllers[channel_id]->send(aim_req) == false) {
+                            if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
                                 remaining_AiM_requests[channel_id].push(aim_req);
                                 all_AiM_requests_sent = false;
                             }
-                            stalled_AiM_requests += 1;
+                            else {
+                                stalls[channel_id] += 1;
+                            }
                         }
                         break;
                     } break;
@@ -368,11 +367,13 @@ public:
                             aim_req.AiM_req_id = AiM_req_id++;
                             aim_req.host_req_id = host_req.host_req_id;
                             // m_logger->info("[CLK {}] 3- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
-                            if (m_controllers[channel_id]->send(aim_req) == false) {
+                            if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
                                 remaining_AiM_requests[channel_id].push(aim_req);
                                 all_AiM_requests_sent = false;
                             }
-                            stalled_AiM_requests += 1;
+                            else {
+                                stalls[channel_id] += 1;
+                            }
                         }
                         break;
                     } break;
@@ -401,7 +402,7 @@ public:
                         apply_addr_mapp(aim_req, aim_req.channel_mask);
                         int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
                         // m_logger->info("[CLK {}] 4- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
-                        if (m_controllers[channel_id]->send(aim_req) == false) {
+                        if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
                             remaining_AiM_requests[channel_id].push(aim_req);
                             all_AiM_requests_sent = false;
                         }
@@ -436,7 +437,7 @@ public:
                         apply_addr_mapp(aim_req, aim_req.channel_mask);
                         int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
                         // m_logger->info("[CLK {}] 5- Sending {} to channel {}, channel_mask {}", m_clk, aim_req.str(), channel_id, aim_req.channel_mask);
-                        if (m_controllers[channel_id]->send(aim_req) == false) {
+                        if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
                             remaining_AiM_requests[channel_id].push(aim_req);
                             all_AiM_requests_sent = false;
                             // m_logger->info("[CLK {}] 4- failed", aim_req.str(), m_clk, channel_id, aim_req.channel_mask);
@@ -457,13 +458,10 @@ public:
                     break;
                 }
                 }
-                if ((stalled_AiM_requests == 0) && (all_AiM_requests_sent == true)) {
-                    if (host_req.callback)
-                        host_req.callback(host_req);
+                if (all_AiM_requests_sent == true) {
                     request_queue.pop();
                 }
             }
-        }
 
         if (m_clk % m_controllers[0]->get_clock_ratio() == 0) {
             m_dram->tick();
@@ -476,16 +474,18 @@ public:
     };
 
     void receive(Request &req) {
-        Request host_req = request_queue.front();
-        if (req.host_req_id != host_req.host_req_id)
-            throw ConfigurationError("AiMDRAMSystem: received request id {} != head of the queue request id {}!", req.host_req_id, host_req.host_req_id);
+        int channel_id = req.addr_vec[m_dram->m_levels("channel")];
+        stalls[channel_id]--;
 
-        stalled_AiM_requests--;
+        bool all_free = true;
+        for (int channel_id = 0; channel_id < m_controllers.size(); channel_id++) {
+            if (stalls[channel_id])
+                all_free = false;
+        }
 
-        if (stalled_AiM_requests == 0) {
-            if (host_req.callback)
-                host_req.callback(host_req);
-            request_queue.pop();
+        if (all_free) {
+            if (req.callback)
+                req.callback(req);
         }
     }
 

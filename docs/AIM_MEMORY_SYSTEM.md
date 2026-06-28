@@ -91,3 +91,49 @@ After D's `was_AiM_request_remaining` gate is removed, `decompose()` runs once p
 - `src/memory_system/impl/aim_DRAM_system_test.cpp` — gtest cases for the helpers.
 - `src/base/request.h` — Request, AiMISR, opcode tables.
 - `src/frontend/impl/memory_trace/aim_trace.cpp` — frontend that parses traces and pushes host_reqs into the memory system.
+
+## How this maps to AiM hardware
+
+The simulator's `AiMDRAMSystem` class plays the role of the **AiM DMA + multicasting interconnect** in the SK hynix platform (HW whitepaper Figs 3 and 7); the per-channel `IDRAMController` is the **AiM controller** in HW whitepaper Fig 5. The class name is misleading — it isn't the DRAM itself.
+
+| code | hardware |
+|---|---|
+| `host_request_queue` | ISR register (MMIO range receiving 256-bit ISR instructions from the host over PCIe) |
+| `decompose()` | AiM DMA's "decode ISR → emit sequence of fine-grained AiM requests" stage |
+| inner channel loop in decompose | multicasting interconnect duplicating one AiM request across every channel in `CH_MASK` |
+| `channel_pending_queues[ch]` | per-channel request stream entering each AiM controller |
+| `IDRAMController` | AiM controller (Row Arbiter + Bank/AiM/Refresh engines + Engine Arbiter + PHY) |
+| CFR map (`BROADCAST` / `EWMUL_BG` / `AFM`) | controller mode-config bits set by `ISR_WR_CFR` |
+
+`ISR_SYNC` and `ISR_EOC` are not real ISR opcodes — the real set is in SW whitepaper Fig 2 / HW whitepaper Fig 4. They're simulator conventions: `ISR_EOC` is the trace terminator the AiMTrace frontend uses to stop; `ISR_SYNC` is a barrier primitive. Host callbacks are also simulator-only — the real DMA tracks completion via internal sequence numbers.
+
+### The three rate-limit layers
+
+| Layer | Per-tick behavior in the simulator | Hardware analog |
+|---|---|---|
+| 1. Decompose | 1 host_req per tick; the host_req's *entire* aim_req expansion lands in the channel queues that tick | AiM DMA emitting aim_reqs sequentially over many cycles + interconnect fan-out latency |
+| 2. Drain (`controller->send()`) | Per channel, send as many as `stalls==0` allows AND the controller's intake queue accepts (size 64) | multicasting interconnect → controller request port |
+| 3. Controller tick | One DRAM command per tick per channel, subject to GDDR6-AiM timing (`tCK`, `tCCDS`, ACT→RD/WR, refresh, …) | AiM controller scheduler + PHY |
+
+**Layer 3 dominates wall time for compute-bound workloads.** Ramulator's DRAM timing model serializes commands per channel at the real per-command pace. So even when `MAC_ABK 63` lands 64 aim_reqs into a channel's controller queue in a single decompose tick, they still drain through the PHY at the real per-command rate.
+
+What the simulator approximates is **when** aim_reqs become available to each controller, not **how fast** the controller processes them:
+
+- **Faithful (Layer 3)**: per-command DRAM timing; per-channel scheduling independence (matches AiM controller Fig 5); bank/bankgroup mapping (4 BG × 4 banks per channel matches HW whitepaper Fig 2); OPSIZE → `opsize + 1` AiM requests; CH_MASK fan-out.
+- **Approximate (Layers 1–2)**: DMA emission rate is treated as one ISR per tick (all aim_reqs in that ISR materialize immediately in the channel queues); interconnect transit time and intake-queue contention are not modeled.
+- **Invented**: `ISR_SYNC`, `ISR_EOC`, host callbacks.
+
+The Layer-1/2 approximations don't show up in cycle counts for `uni_N` or `bcast_N` because both workloads are compute-bound. They would matter for a workload that stressed the interconnect (high ISR-rate, narrow per-ISR work).
+
+### Implications for the decouple-stalls experiments
+
+1. **The pre-decouple `fixes` global stall gate was a fidelity bug, not just a perf gap.** The HW whitepaper's per-channel AiM controller (Fig 5) has no architectural mechanism for one channel's blocking `RD_MAC` to gate dispatch to another channel — the multicasting interconnect is one-to-many, and each controller has its own scheduler. The pre-decouple code modeled a serialization the hardware doesn't have. The decouple-stalls effort was correcting an artifact, not just optimizing.
+2. **`bcast_N` is closer to real workloads than `uni_N`.** The HW whitepaper's GEMV example uses `CH_MASK = 0xF` to hit all 4 channels with a single ISR_MAC_ABK. Production workloads issue ISRs with wide channel masks; `uni_N`'s one-channel-per-ISR pattern is a micro-benchmark that maximally exercises the pre-decouple bottleneck. The 31× headline speedup is what the bottleneck looked like in the worst case; realistic workloads sit closer to the bcast curve.
+3. **The flat-vs-linear contrast in `uni_N` is real, but the absolute speedup is workload-dependent.** Widening CH_MASK to span more channels per ISR (broadcast direction) narrows the gap; emitting many one-channel ISRs widens it.
+
+### Source documents
+
+- `docs/aim-spec.pdf` — ISSCC 2022 paper. AiM device architecture (16 banks × 16 PUs, 2KB GB, BWMS multiplier).
+- `docs/aim-hardware-whitepaper.pdf` — AiM platform hardware: DMA + multicasting interconnect + per-channel controller; ISR encoding; GEMV example flow.
+- `docs/aim-software-whitepaper.pdf` — software stack: PyTorch/ONNX integration, runtime ISR generation, FPGA memory zones.
+- `docs/gddr6-spec.pdf` — base GDDR6 standard (not summarized here).

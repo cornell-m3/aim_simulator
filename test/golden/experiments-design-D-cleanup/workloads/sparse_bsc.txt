@@ -1,0 +1,16 @@
+    CH0_cycles_AiM_ISR_MAC_ABK: 11644
+    CH0_cycles_AiM_ISR_RD_MAC: 1023
+    CH0_cycles_AiM_ISR_WR_BIAS: 63
+    CH15_cycles_AiM_ISR_MAC_ABK: 11499
+    CH15_cycles_AiM_ISR_RD_MAC: 990
+    CH15_cycles_AiM_ISR_WR_BIAS: 62
+    CH31_cycles_AiM_ISR_MAC_ABK: 11499
+    CH31_cycles_AiM_ISR_RD_MAC: 990
+    CH31_cycles_AiM_ISR_WR_BIAS: 62
+  memory_system_cycles: 25149
+  total_num_AiM_ISR_EOC_requests: 1
+  total_num_AiM_ISR_MAC_ABK_requests: 69
+  total_num_AiM_ISR_RD_MAC_requests: 31
+  total_num_AiM_ISR_SYNC_requests: 0
+  total_num_AiM_ISR_WR_BIAS_requests: 31
+  total_num_wait_read_stalls: 9182

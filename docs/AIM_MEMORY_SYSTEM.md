@@ -43,6 +43,15 @@ The pre-decouple `fixes` commit had a single global stall counter that gated the
 
 Baseline scales linearly in the channel count; the decoupled designs stay flat. (Workload: 10 rounds of `WR_BIAS + MAC_ABK 63 + RD_MAC` per active channel + `ISR_EOC`.)
 
+There's a companion `bcast_N` family that packs the same per-channel work into a single host_req per round (channel_mask = bits 0..N-1, fanning out to N channels in one decompose). The numbers are flat at 2860 cycles across *every* branch — including the pre-decouple baseline:
+
+| Branch              | N=1   | N=2   | N=4   | N=8   | N=16  | N=32  |
+|---------------------|-------|-------|-------|-------|-------|-------|
+| 0a413a6 (baseline)  | 2860  | 2860  | 2860  | 2860  | 2860  | 2860  |
+| design A / B / C / D| 2860  | 2860  | 2860  | 2860  | 2860  | 2860  |
+
+This is the contrapositive of the headline result: the pre-decouple bottleneck was the global stall gate *between host_reqs*. Pack the same work into 31 host_reqs (bcast) instead of 30·N+1 (uni) and the bottleneck doesn't fire. The decouple-stalls effort closed a gap that only exists when traces emit many small host_reqs — exactly the access pattern of real workloads.
+
 ## The host-callback join
 
 The frontend attaches a callback to `ISR_EOC` (and would attach one to any other host_req it wants notification on). That callback fires when the memory system has finished the host_req's work. Designs A and B implement this as a global "all channels free" barrier; designs C and D implement it as a per-host barrier on a required-channels mask.

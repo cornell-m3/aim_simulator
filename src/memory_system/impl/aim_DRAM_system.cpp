@@ -367,7 +367,13 @@ public:
     }
 
     void tick() override {
-        // Phase 1: drain per-channel queues
+        // Phase 1: decompose one host_req from request_queue
+        if (!request_queue.empty()) {
+            decompose(request_queue.front());
+            request_queue.pop();
+        }
+
+        // Phase 2: drain per-channel queues
         for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
             while (!remaining_AiM_requests[channel_id].empty() && stalls[channel_id] == 0) {
                 Request &aim = remaining_AiM_requests[channel_id].front();
@@ -377,12 +383,6 @@ public:
                     stalls[channel_id] += 1;
                 remaining_AiM_requests[channel_id].pop();
             }
-        }
-
-        // Phase 2: decompose one host_req from request_queue
-        if (!request_queue.empty()) {
-            decompose(request_queue.front());
-            request_queue.pop();
         }
 
         // Phase 3: tick DRAM and controllers

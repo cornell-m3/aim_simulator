@@ -529,7 +529,7 @@ static AiMISRInfo AiM_host_request_info();
 
 struct ReqBuffer {
     std::list<Request> buffer;
-    size_t max_size = 32;
+    size_t max_size = 64;
 
     using iterator = std::list<Request>::iterator;
     iterator begin() { return buffer.begin(); };

@@ -16,6 +16,26 @@ namespace Ramulator {
 #define ISR_SIZE (1 << 21)
 #define MAX_CHANNEL_COUNT 32
 
+// Design B: per-channel pipelines with a phase-structured tick().
+//
+// tick() has three phases:
+//   1. decompose: pop one host_req from host_request_queue and split it into
+//      per-channel aim_reqs. aim_reqs go straight into channel_pending_queues —
+//      decompose never calls controller->send().
+//   2. drain: for each channel, send aim_reqs from channel_pending_queues[ch]
+//      to the controller until stalls[ch] becomes nonzero (blocking aim_req in
+//      flight) or the controller refuses. This is the ONLY send path.
+//   3. controllers tick.
+//
+// Decomposing before draining lets newly-queued aim_reqs ship to the controller
+// in the same tick they were decomposed (no extra latency for the trailing
+// host_req).
+//
+// Blocking-completion callbacks (e.g. ISR_EOC's frontend "trace done" hook)
+// are stashed in pending_host_callbacks at decompose time and fired in
+// receive() once every channel reports stalls=0 AND its pending queue is
+// empty. The empty-queue clause closes a race where a freshly-decomposed but
+// unsent aim_req could otherwise be skipped at the barrier.
 class AiMDRAMSystem final : public IMemorySystem, public Implementation {
     RAMULATOR_REGISTER_IMPLEMENTATION(IMemorySystem, AiMDRAMSystem, "AiMDRAM", "AiM memory system (AiM DMA).");
 
@@ -23,18 +43,25 @@ protected:
     Clk_t m_clk = 0;
     IDRAM *m_dram;
     int m_num_levels = -1;
-    bool m_has_rank = false; // Does the DRAM have rank level?
+    bool m_has_rank = false;
     IAddrMapper *m_addr_mapper;
     std::vector<IDRAMController *> m_controllers;
     Logger_t m_logger;
-    std::queue<Request> request_queue;
-    std::queue<Request> remaining_AiM_requests[MAX_CHANNEL_COUNT];
+
+    // Host requests as they arrive from the frontend; one is decomposed per tick.
+    std::queue<Request> host_request_queue;
+    // Per-channel FIFO of aim_reqs awaiting controller send.
+    std::queue<Request> channel_pending_queues[MAX_CHANNEL_COUNT];
     int AiM_req_id = 0;
 
-    int stalled_AiM_requests = 0;
+    // stalls[ch] = number of in-flight blocking aim_reqs on channel ch.
+    // A channel with stalls[ch] > 0 won't accept new sends until receive() fires.
     std::vector<int> stalls;
-    std::vector<Request> pending_joins;
+    // Host requests whose callback should fire at the next all-free join
+    // (i.e. when every channel has stalls=0 and an empty pending queue).
+    std::vector<Request> pending_host_callbacks;
 
+    // Bound to receive(); used as the aim_req-completion callback by the controller.
     std::function<void(Request &)> callback;
 
     enum class CFR {
@@ -183,12 +210,11 @@ public:
 
     bool send(Request req) override {
 
-        if (request_queue.size() == ISR_SIZE) {
+        if (host_request_queue.size() == ISR_SIZE) {
             s_ISR_queue_full++;
             return false;
         }
-        request_queue.push(req);
-        // m_logger->info("[CLK {}] {} pushed to the queue!", m_clk, req.str());
+        host_request_queue.push(req);
 
         switch (req.type) {
         case Type::AIM: {
@@ -209,12 +235,21 @@ public:
         return true;
     };
 
+    // True if this aim_req carries DMA-blocking semantics (RD_MAC, RD_AF, SYNC,
+    // EOC). Used by the drain loop to decide whether to bump stalls[ch] on send.
+    // Note: aim_reqs synthesized from ISR_RD_SBK/ISR_WR_SBK are remapped to
+    // Type::Read/Write with opcode=Opcode::MIN — those are never blocking.
     bool is_blocking_aim_req(const Request &aim) const {
         if (aim.type != Type::AIM) return false;
         if (aim.opcode == Opcode::MIN) return false;
         return AiMISRInfo::convert_AiM_opcode_to_AiM_ISR(aim.opcode).AiM_DMA_blocking;
     }
 
+    // Split a host_req into per-channel aim_reqs and push each onto the
+    // appropriate channel_pending_queues[ch]. Never calls controller->send().
+    // If the host_req has a callback (the frontend sets this on ISR_EOC), the
+    // host_req is also pushed to pending_host_callbacks so the all-free barrier
+    // in receive() can fire it once every channel finishes.
     void decompose(Request host_req) {
         switch (host_req.type) {
         case Type::AIM: {
@@ -253,7 +288,7 @@ public:
                 if (aim_ISR.AiM_DMA_blocking) {
                     aim_req.callback = callback;
                     if (host_req.callback)
-                        pending_joins.push_back(host_req);
+                        pending_host_callbacks.push_back(host_req);
                 }
 
                 if (aim_ISR.channel_count_eq_one && channel_count != 1) {
@@ -290,7 +325,7 @@ public:
                         apply_addr_mapp(aim_req, channel_id);
                         assert(channel_id < m_controllers.size());
                         assert(channel_id < MAX_CHANNEL_COUNT);
-                        remaining_AiM_requests[channel_id].push(aim_req);
+                        channel_pending_queues[channel_id].push(aim_req);
                     }
                 }
                 break;
@@ -303,14 +338,14 @@ public:
             case Opcode::ISR_EOC: {
                 aim_req.callback = callback;
                 if (host_req.callback)
-                    pending_joins.push_back(host_req);
+                    pending_host_callbacks.push_back(host_req);
                 for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
                     aim_req.AiM_req_id = AiM_req_id++;
                     aim_req.host_req_id = host_req.host_req_id;
                     if ((int)aim_req.addr_vec.size() < m_num_levels)
                         aim_req.addr_vec.resize(m_num_levels, -1);
                     aim_req.addr_vec[m_dram->m_levels("channel")] = channel_id;
-                    remaining_AiM_requests[channel_id].push(aim_req);
+                    channel_pending_queues[channel_id].push(aim_req);
                 }
                 break;
             }
@@ -330,7 +365,7 @@ public:
                 aim_req.AiM_req_id = AiM_req_id++;
                 apply_addr_mapp(aim_req, aim_req.channel_mask);
                 int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
-                remaining_AiM_requests[channel_id].push(aim_req);
+                channel_pending_queues[channel_id].push(aim_req);
                 break;
             }
             default:
@@ -353,7 +388,7 @@ public:
                 aim_req.AiM_req_id = AiM_req_id++;
                 apply_addr_mapp(aim_req, aim_req.channel_mask);
                 int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
-                remaining_AiM_requests[channel_id].push(aim_req);
+                channel_pending_queues[channel_id].push(aim_req);
                 break;
             }
             default:
@@ -367,21 +402,21 @@ public:
     }
 
     void tick() override {
-        // Phase 1: decompose one host_req from request_queue
-        if (!request_queue.empty()) {
-            decompose(request_queue.front());
-            request_queue.pop();
+        // Phase 1: decompose one host_req from host_request_queue
+        if (!host_request_queue.empty()) {
+            decompose(host_request_queue.front());
+            host_request_queue.pop();
         }
 
         // Phase 2: drain per-channel queues
         for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
-            while (!remaining_AiM_requests[channel_id].empty() && stalls[channel_id] == 0) {
-                Request &aim = remaining_AiM_requests[channel_id].front();
+            while (!channel_pending_queues[channel_id].empty() && stalls[channel_id] == 0) {
+                Request &aim = channel_pending_queues[channel_id].front();
                 if (m_controllers[channel_id]->send(aim) == false)
                     break;
                 if (is_blocking_aim_req(aim))
                     stalls[channel_id] += 1;
-                remaining_AiM_requests[channel_id].pop();
+                channel_pending_queues[channel_id].pop();
             }
         }
 
@@ -396,24 +431,31 @@ public:
         m_clk++;
     };
 
+    // Invoked by the controller when an aim_req with this->callback set completes.
+    // Clears the channel's stall and, if every channel is fully drained (no stalls
+    // and no queued aim_reqs), fires any host callbacks waiting on the join.
     void receive(Request &req) {
         int channel_id = req.addr_vec[m_dram->m_levels("channel")];
         stalls[channel_id]--;
 
+        // All-free join: every channel must have stalls=0 AND an empty pending
+        // queue. The empty-queue clause is what makes the barrier race-free —
+        // without it, a freshly-decomposed aim_req sitting in the channel queue
+        // could be skipped because its own stall hasn't been bumped yet.
         bool all_free = true;
         for (int ch = 0; ch < (int)m_controllers.size(); ch++) {
-            if (stalls[ch] != 0 || !remaining_AiM_requests[ch].empty()) {
+            if (stalls[ch] != 0 || !channel_pending_queues[ch].empty()) {
                 all_free = false;
                 break;
             }
         }
 
-        if (all_free && !pending_joins.empty()) {
-            for (auto &h : pending_joins) {
+        if (all_free && !pending_host_callbacks.empty()) {
+            for (auto &h : pending_host_callbacks) {
                 if (h.callback)
                     h.callback(h);
             }
-            pending_joins.clear();
+            pending_host_callbacks.clear();
         }
     }
 

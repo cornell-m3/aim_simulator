@@ -33,6 +33,7 @@ protected:
 
     int stalled_AiM_requests = 0;
     std::vector<int> stalls;
+    std::vector<Request> pending_joins;
 
     std::function<void(Request &)> callback;
 
@@ -208,261 +209,183 @@ public:
         return true;
     };
 
-    void tick() override {
+    bool is_blocking_aim_req(const Request &aim) const {
+        if (aim.type != Type::AIM) return false;
+        if (aim.opcode == Opcode::MIN) return false;
+        return AiMISRInfo::convert_AiM_opcode_to_AiM_ISR(aim.opcode).AiM_DMA_blocking;
+    }
 
-        bool was_AiM_request_remaining = false;
-        bool is_AiM_request_remaining = false;
-        for (int channel_id = 0; channel_id < MAX_CHANNEL_COUNT; channel_id++) {
-            while (remaining_AiM_requests[channel_id].empty() == false) {
-                was_AiM_request_remaining = true;
-                // m_logger->info("[CLK {}] 0- Sending {} to channel {}", m_clk, remaining_AiM_requests[channel_id].front().str(), channel_id);
-                if (stalls[channel_id] || m_controllers[channel_id]->send(remaining_AiM_requests[channel_id].front()) == false) {
-                    // m_logger->info("[CLK {}] 0- failed", m_clk, channel_id);
-                    is_AiM_request_remaining = true;
-                    break;
+    void decompose(Request host_req) {
+        switch (host_req.type) {
+        case Type::AIM: {
+            Opcode opcode = host_req.opcode;
+            auto opsize = host_req.opsize;
+            int64_t ch_mask = host_req.channel_mask;
+            uint8_t channel_count = CountSetBit(ch_mask);
+            Request aim_req = host_req;
+            aim_req.callback = std::function<void(Request &)>();
+            if (aim_req.opcode == Opcode::ISR_RD_SBK) {
+                aim_req.type = Type::Read;
+                aim_req.mem_access_region = MemAccessRegion::MEM;
+                aim_req.opcode = Opcode::MIN;
+            } else if (aim_req.opcode == Opcode::ISR_WR_SBK) {
+                aim_req.type = Type::Write;
+                aim_req.mem_access_region = MemAccessRegion::MEM;
+                aim_req.opcode = Opcode::MIN;
+            }
+
+            switch (opcode) {
+            case Opcode::ISR_WR_SBK:
+            case Opcode::ISR_WR_GB:
+            case Opcode::ISR_WR_BIAS:
+            case Opcode::ISR_RD_MAC:
+            case Opcode::ISR_RD_AF:
+            case Opcode::ISR_RD_SBK:
+            case Opcode::ISR_COPY_BKGB:
+            case Opcode::ISR_COPY_GBBK:
+            case Opcode::ISR_MAC_SBK:
+            case Opcode::ISR_MAC_ABK:
+            case Opcode::ISR_AF:
+            case Opcode::ISR_EWMUL:
+            case Opcode::ISR_WR_ABK: {
+                AiMISR aim_ISR = AiMISRInfo::convert_AiM_opcode_to_AiM_ISR(opcode);
+
+                if (aim_ISR.AiM_DMA_blocking) {
+                    aim_req.callback = callback;
+                    if (host_req.callback)
+                        pending_joins.push_back(host_req);
                 }
+
+                if (aim_ISR.channel_count_eq_one && channel_count != 1) {
+                    throw ConfigurationError("AiMDRAMSystem: channel mask ({}) of ISR_WR_SBK must specify only 1 channel!", ch_mask);
+                }
+
+                if (opcode == Opcode::ISR_AF) {
+                    aim_req.afm = CFR_values[CFR::AFM];
+                    aim_req.row_addr = (1 << 29) + aim_req.afm;
+                }
+
+                if (host_req.opcode == Opcode::ISR_MAC_ABK || host_req.opcode == Opcode::ISR_MAC_SBK)
+                    aim_req.broadcast = CFR_values[CFR::BROADCAST];
+
+                if (host_req.opcode == Opcode::ISR_MAC_ABK)
+                    aim_req.ewmul_bg = CFR_values[CFR::EWMUL_BG];
+
+                if (aim_ISR.is_field_legal(AiMISR::Field::bank_index))
+                    aim_req.bank_index = host_req.bank_index;
+
+                if (aim_ISR.is_field_legal(AiMISR::Field::row_addr))
+                    aim_req.row_addr = host_req.row_addr;
+
+                if (opsize == -1) opsize = 0;
+                if (host_req.col_addr == -1) host_req.col_addr = 0;
+
+                for (int i = 0; i <= opsize; i++) {
+                    int64_t channel_mask = ch_mask;
+                    aim_req.col_addr = host_req.col_addr + i;
+                    for (int cnt = 0; cnt < channel_count; cnt++) {
+                        uint8_t channel_id = FindFirstChannelIndex(channel_mask);
+                        aim_req.AiM_req_id = AiM_req_id++;
+                        aim_req.host_req_id = host_req.host_req_id;
+                        apply_addr_mapp(aim_req, channel_id);
+                        assert(channel_id < m_controllers.size());
+                        assert(channel_id < MAX_CHANNEL_COUNT);
+                        remaining_AiM_requests[channel_id].push(aim_req);
+                    }
+                }
+                break;
+            }
+            case Opcode::ISR_WR_AFLUT:
+                throw ConfigurationError("AiMDRAMSystem: ISR_WR_AFLUT not supported by now!");
+            case Opcode::ISR_EWADD:
+                break;
+            case Opcode::ISR_SYNC:
+            case Opcode::ISR_EOC: {
+                aim_req.callback = callback;
+                if (host_req.callback)
+                    pending_joins.push_back(host_req);
+                for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
+                    aim_req.AiM_req_id = AiM_req_id++;
+                    aim_req.host_req_id = host_req.host_req_id;
+                    if ((int)aim_req.addr_vec.size() < m_num_levels)
+                        aim_req.addr_vec.resize(m_num_levels, -1);
+                    aim_req.addr_vec[m_dram->m_levels("channel")] = channel_id;
+                    remaining_AiM_requests[channel_id].push(aim_req);
+                }
+                break;
+            }
+            default:
+                m_logger->error("unknown command \n");
+                break;
+            }
+            break;
+        }
+        case Type::Read: {
+            switch (host_req.mem_access_region) {
+            case MemAccessRegion::CFR:
+            case MemAccessRegion::GPR:
+                break;
+            case MemAccessRegion::MEM: {
+                Request aim_req = host_req;
+                aim_req.AiM_req_id = AiM_req_id++;
+                apply_addr_mapp(aim_req, aim_req.channel_mask);
+                int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
+                remaining_AiM_requests[channel_id].push(aim_req);
+                break;
+            }
+            default:
+                throw ConfigurationError("AiMDRAMSystem: memory access region {}!", (int)host_req.mem_access_region);
+            }
+            break;
+        }
+        case Type::Write: {
+            switch (host_req.mem_access_region) {
+            case MemAccessRegion::CFR: {
+                if (address_to_CFR.find(host_req.addr) == address_to_CFR.end())
+                    throw ConfigurationError("AiMDRAMSystem: unknown CFR at location {}!", (int)host_req.addr);
+                CFR_values[address_to_CFR[host_req.addr]] = host_req.data;
+                break;
+            }
+            case MemAccessRegion::GPR:
+                break;
+            case MemAccessRegion::MEM: {
+                Request aim_req = host_req;
+                aim_req.AiM_req_id = AiM_req_id++;
+                apply_addr_mapp(aim_req, aim_req.channel_mask);
+                int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
+                remaining_AiM_requests[channel_id].push(aim_req);
+                break;
+            }
+            default:
+                throw ConfigurationError("AiMDRAMSystem: memory access region {}!", (int)host_req.mem_access_region);
+            }
+            break;
+        }
+        default:
+            throw ConfigurationError("AiMDRAMSystem: unknown request type {}!", (int)host_req.type);
+        }
+    }
+
+    void tick() override {
+        // Phase 1: drain per-channel queues
+        for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
+            while (!remaining_AiM_requests[channel_id].empty() && stalls[channel_id] == 0) {
+                Request &aim = remaining_AiM_requests[channel_id].front();
+                if (m_controllers[channel_id]->send(aim) == false)
+                    break;
+                if (is_blocking_aim_req(aim))
+                    stalls[channel_id] += 1;
                 remaining_AiM_requests[channel_id].pop();
             }
         }
 
-            if (was_AiM_request_remaining == true) {
-                if (is_AiM_request_remaining == false) {
-                    request_queue.pop();
-                }
-            } else if (request_queue.empty() == false) {
-                Request host_req = request_queue.front();
-                // m_logger->info("[CLK {}] Decoding {}...", m_clk, host_req.str());
-                bool all_AiM_requests_sent = true;
+        // Phase 2: decompose one host_req from request_queue
+        if (!request_queue.empty()) {
+            decompose(request_queue.front());
+            request_queue.pop();
+        }
 
-                switch (host_req.type) {
-                case Type::AIM: {
-                    Opcode opcode = host_req.opcode;
-                    auto opsize = host_req.opsize;
-                    int64_t ch_mask = host_req.channel_mask;
-                    uint8_t channel_count = CountSetBit(ch_mask);
-                    Request aim_req = host_req;
-                    if (aim_req.opcode == Opcode::ISR_RD_SBK) {
-                        aim_req.type = Type::Read;
-                        aim_req.mem_access_region = MemAccessRegion::MEM;
-                        aim_req.opcode = Opcode::MIN;
-                    } else if (aim_req.opcode == Opcode::ISR_WR_SBK) {
-                        aim_req.type = Type::Write;
-                        aim_req.mem_access_region = MemAccessRegion::MEM;
-                        aim_req.opcode = Opcode::MIN;
-                    }
-
-                    switch (opcode) {
-
-                    case Opcode::ISR_WR_SBK:
-                    case Opcode::ISR_WR_GB:
-                    case Opcode::ISR_WR_BIAS:
-                    case Opcode::ISR_RD_MAC:
-                    case Opcode::ISR_RD_AF:
-                    case Opcode::ISR_RD_SBK:
-                    case Opcode::ISR_COPY_BKGB:
-                    case Opcode::ISR_COPY_GBBK:
-                    case Opcode::ISR_MAC_SBK:
-                    case Opcode::ISR_MAC_ABK:
-                    case Opcode::ISR_AF:
-                    case Opcode::ISR_EWMUL:
-                    case Opcode::ISR_WR_ABK: {
-                        // Decoding opcode
-                        AiMISR aim_ISR = AiMISRInfo::convert_AiM_opcode_to_AiM_ISR(opcode);
-
-                        if (aim_ISR.AiM_DMA_blocking) {
-                            aim_req.callback = callback;
-                        }
-
-                        if (aim_ISR.channel_count_eq_one) {
-                            if (channel_count != 1) {
-                                throw ConfigurationError("AiMDRAMSystem: channel mask ({}) of ISR_WR_SBK must specify only 1 channel!", ch_mask);
-                            }
-                        }
-
-                        if (opcode == Opcode::ISR_AF) {
-                            aim_req.afm = CFR_values[CFR::AFM];
-                            aim_req.row_addr = (1 << 29) + aim_req.afm;
-                        }
-
-                        if ((host_req.opcode == Opcode::ISR_MAC_ABK) ||
-                            (host_req.opcode == Opcode::ISR_MAC_SBK)) {
-                            aim_req.broadcast = CFR_values[CFR::BROADCAST];
-                        }
-
-                        if (host_req.opcode == Opcode::ISR_MAC_ABK) {
-                            aim_req.ewmul_bg = CFR_values[CFR::EWMUL_BG];
-                        }
-
-                        if (aim_ISR.is_field_legal(AiMISR::Field::bank_index) == true)
-                            aim_req.bank_index = host_req.bank_index;
-
-                        if (aim_ISR.is_field_legal(AiMISR::Field::row_addr) == true)
-                            aim_req.row_addr = host_req.row_addr;
-
-                        if (opsize == -1)
-                            opsize = 0;
-
-                        if (host_req.col_addr == -1)
-                            host_req.col_addr = 0;
-
-                        for (int i = 0; i <= opsize; i++) {
-                            int64_t channel_mask = ch_mask;
-
-                            // if (aim_ISR.is_field_legal(AiMISR::Field::col_addr) == true)
-                            aim_req.col_addr = host_req.col_addr + i;
-
-                            for (int cnt = 0; cnt < channel_count; cnt++) {
-                                uint8_t channel_id = FindFirstChannelIndex(channel_mask);
-
-                                aim_req.AiM_req_id = AiM_req_id++;
-                                aim_req.host_req_id = host_req.host_req_id;
-                                apply_addr_mapp(aim_req, channel_id);
-                                // m_logger->info("[CLK {}] 1- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
-                                assert(channel_id < m_controllers.size());
-                                assert(channel_id < MAX_CHANNEL_COUNT);
-                                if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
-                                    remaining_AiM_requests[channel_id].push(aim_req);
-                                    all_AiM_requests_sent = false;
-                                    // m_logger->info("[CLK {}] 1- failed", aim_req.str(), m_clk, channel_id);
-                                }
-                                else if (aim_ISR.AiM_DMA_blocking) {
-                                    stalls[channel_id] += 1;
-                                }
-                            }
-                        }
-
-                        break;
-                    }
-
-                    case Opcode::ISR_WR_AFLUT: {
-                        throw ConfigurationError("AiMDRAMSystem: ISR_WR_AFLUT not supported by now!");
-                        break;
-                    }
-
-                    case Opcode::ISR_EWADD: {
-                        // Do nothing
-                        break;
-                    }
-
-                    case Opcode::ISR_SYNC: {
-                        aim_req.callback = callback;
-                        for (int channel_id = 0; channel_id < m_controllers.size(); channel_id++) {
-                            aim_req.AiM_req_id = AiM_req_id++;
-                            aim_req.host_req_id = host_req.host_req_id;
-                            // m_logger->info("[CLK {}] 2- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
-                            if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
-                                remaining_AiM_requests[channel_id].push(aim_req);
-                                all_AiM_requests_sent = false;
-                            }
-                            else {
-                                stalls[channel_id] += 1;
-                            }
-                        }
-                        break;
-                    } break;
-
-                    case Opcode::ISR_EOC: {
-                        aim_req.callback = callback;
-                        for (int channel_id = 0; channel_id < m_controllers.size(); channel_id++) {
-                            aim_req.AiM_req_id = AiM_req_id++;
-                            aim_req.host_req_id = host_req.host_req_id;
-                            // m_logger->info("[CLK {}] 3- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
-                            if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
-                                remaining_AiM_requests[channel_id].push(aim_req);
-                                all_AiM_requests_sent = false;
-                            }
-                            else {
-                                stalls[channel_id] += 1;
-                            }
-                        }
-                        break;
-                    } break;
-
-                    default:
-                        m_logger->error("unknown command \n");
-                        break;
-                    }
-                } break;
-                case Type::Read: {
-                    switch (host_req.mem_access_region) {
-                    case MemAccessRegion::CFR: {
-                        // Do nothing
-                        all_AiM_requests_sent = true;
-                        break;
-                    }
-                    case MemAccessRegion::GPR: {
-                        // Do nothing
-                        all_AiM_requests_sent = true;
-                        break;
-                    }
-                    case MemAccessRegion::MEM: {
-                        Request aim_req = host_req;
-                        // aim_req.callback = callback;
-                        aim_req.AiM_req_id = AiM_req_id++;
-                        apply_addr_mapp(aim_req, aim_req.channel_mask);
-                        int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
-                        // m_logger->info("[CLK {}] 4- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
-                        if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
-                            remaining_AiM_requests[channel_id].push(aim_req);
-                            all_AiM_requests_sent = false;
-                        }
-                        // stalled_AiM_requests += 1;
-                        break;
-                    }
-                    default: {
-                        throw ConfigurationError("AiMDRAMSystem: memory access region {}!", (int)host_req.mem_access_region);
-                        break;
-                    }
-                    }
-                    break;
-                }
-                case Type::Write: {
-                    switch (host_req.mem_access_region) {
-                    case MemAccessRegion::CFR: {
-                        if (address_to_CFR.find(host_req.addr) == address_to_CFR.end()) {
-                            throw ConfigurationError("AiMDRAMSystem: unknown CFR at location {}!", (int)host_req.addr);
-                        }
-                        CFR_values[address_to_CFR[host_req.addr]] = host_req.data;
-                        all_AiM_requests_sent = true;
-                        break;
-                    }
-                    case MemAccessRegion::GPR: {
-                        // Do nothing
-                        all_AiM_requests_sent = true;
-                        break;
-                    }
-                    case MemAccessRegion::MEM: {
-                        Request aim_req = host_req;
-                        aim_req.AiM_req_id = AiM_req_id++;
-                        apply_addr_mapp(aim_req, aim_req.channel_mask);
-                        int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
-                        // m_logger->info("[CLK {}] 5- Sending {} to channel {}, channel_mask {}", m_clk, aim_req.str(), channel_id, aim_req.channel_mask);
-                        if (stalls[channel_id] || m_controllers[channel_id]->send(aim_req) == false) {
-                            remaining_AiM_requests[channel_id].push(aim_req);
-                            all_AiM_requests_sent = false;
-                            // m_logger->info("[CLK {}] 4- failed", aim_req.str(), m_clk, channel_id, aim_req.channel_mask);
-                        } else {
-                            // m_logger->info("[CLK {}] 4- sent", aim_req.str(), m_clk, channel_id, aim_req.channel_mask);
-                        }
-                        break;
-                    }
-                    default: {
-                        throw ConfigurationError("AiMDRAMSystem: memory access region {}!", (int)host_req.mem_access_region);
-                        break;
-                    }
-                    }
-                    break;
-                }
-                default: {
-                    throw ConfigurationError("AiMDRAMSystem: unknown request type {}!", (int)host_req.type);
-                    break;
-                }
-                }
-                if (all_AiM_requests_sent == true) {
-                    request_queue.pop();
-                }
-            }
-
+        // Phase 3: tick DRAM and controllers
         if (m_clk % m_controllers[0]->get_clock_ratio() == 0) {
             m_dram->tick();
             for (auto controller : m_controllers) {
@@ -478,14 +401,19 @@ public:
         stalls[channel_id]--;
 
         bool all_free = true;
-        for (int channel_id = 0; channel_id < m_controllers.size(); channel_id++) {
-            if (stalls[channel_id])
+        for (int ch = 0; ch < (int)m_controllers.size(); ch++) {
+            if (stalls[ch]) {
                 all_free = false;
+                break;
+            }
         }
 
-        if (all_free) {
-            if (req.callback)
-                req.callback(req);
+        if (all_free && !pending_joins.empty()) {
+            for (auto &h : pending_joins) {
+                if (h.callback)
+                    h.callback(h);
+            }
+            pending_joins.clear();
         }
     }
 

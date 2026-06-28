@@ -278,6 +278,41 @@ public:
         return AiMISRInfo::convert_AiM_opcode_to_AiM_ISR(aim.opcode).AiM_DMA_blocking;
     }
 
+    // Bitmask with the low (num_channels) bits set, suitable for use as the
+    // required_channels mask of an all-channel barrier (ISR_SYNC / ISR_EOC).
+    int64_t all_channels_mask() const {
+        const size_t n = m_controllers.size();
+        return n >= kChannelMaskWidth ? -1LL : ((1LL << n) - 1);
+    }
+
+    // Decompose an ISR_SYNC / ISR_EOC host_req: push one blocking aim_req per
+    // channel and register the all-channel barrier in pending_callbacks.
+    void decompose_sync_or_eoc(Request &host_req, Request aim_req) {
+        aim_req.callback = callback;
+        if (host_req.callback)
+            pending_callbacks.push({host_req, all_channels_mask()});
+        for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
+            aim_req.AiM_req_id = AiM_req_id++;
+            aim_req.host_req_id = host_req.host_req_id;
+            if ((int)aim_req.addr_vec.size() < m_num_levels)
+                aim_req.addr_vec.resize(m_num_levels, -1);
+            aim_req.addr_vec[m_dram->m_levels("channel")] = channel_id;
+            channel_pending_queues[channel_id].push(aim_req);
+        }
+    }
+
+    // Decompose a host_req of Type::Read / Type::Write with mem_access_region MEM
+    // (CFR / GPR sub-regions are handled inline because they don't generate aim_reqs).
+    // MEM accesses are non-blocking: no callback is attached to the aim_req — the
+    // host doesn't wait on MEM reads in this model (they're fire-and-forget).
+    void decompose_mem_access(const Request &host_req) {
+        Request aim_req = host_req;
+        aim_req.AiM_req_id = AiM_req_id++;
+        apply_addr_mapp(aim_req, aim_req.channel_mask);
+        int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
+        channel_pending_queues[channel_id].push(aim_req);
+    }
+
     // Split a host_req into per-channel aim_reqs and push each onto the
     // appropriate channel_pending_queues[ch]. Never calls controller->send().
     // If the host_req has a callback (the frontend sets this on ISR_EOC), a
@@ -347,11 +382,11 @@ public:
                     aim_req.row_addr = host_req.row_addr;
 
                 if (opsize == -1) opsize = 0;
-                if (host_req.col_addr == -1) host_req.col_addr = 0;
+                const int64_t base_col = host_req.col_addr == -1 ? 0 : host_req.col_addr;
 
                 for (int i = 0; i <= opsize; i++) {
                     int64_t channel_mask = ch_mask;
-                    aim_req.col_addr = host_req.col_addr + i;
+                    aim_req.col_addr = base_col + i;
                     for (int cnt = 0; cnt < channel_count; cnt++) {
                         uint8_t channel_id = FindFirstChannelIndex(channel_mask);
                         aim_req.AiM_req_id = AiM_req_id++;
@@ -367,22 +402,9 @@ public:
             case Opcode::ISR_EWADD:
                 break;
             case Opcode::ISR_SYNC:
-            case Opcode::ISR_EOC: {
-                aim_req.callback = callback;
-                if (host_req.callback) {
-                    int64_t all_ch_mask = (m_controllers.size() >= 32) ? -1LL : ((1LL << m_controllers.size()) - 1);
-                    pending_callbacks.push({host_req, all_ch_mask});
-                }
-                for (int channel_id = 0; channel_id < (int)m_controllers.size(); channel_id++) {
-                    aim_req.AiM_req_id = AiM_req_id++;
-                    aim_req.host_req_id = host_req.host_req_id;
-                    if ((int)aim_req.addr_vec.size() < m_num_levels)
-                        aim_req.addr_vec.resize(m_num_levels, -1);
-                    aim_req.addr_vec[m_dram->m_levels("channel")] = channel_id;
-                    channel_pending_queues[channel_id].push(aim_req);
-                }
+            case Opcode::ISR_EOC:
+                decompose_sync_or_eoc(host_req, aim_req);
                 break;
-            }
             default:
                 m_logger->error("unknown command \n");
                 break;
@@ -393,15 +415,12 @@ public:
             switch (host_req.mem_access_region) {
             case MemAccessRegion::CFR:
             case MemAccessRegion::GPR:
+                // CFR / GPR reads are register accesses handled by the host;
+                // they don't generate DRAM traffic, so nothing to decompose.
                 break;
-            case MemAccessRegion::MEM: {
-                Request aim_req = host_req;
-                aim_req.AiM_req_id = AiM_req_id++;
-                apply_addr_mapp(aim_req, aim_req.channel_mask);
-                int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
-                channel_pending_queues[channel_id].push(aim_req);
+            case MemAccessRegion::MEM:
+                decompose_mem_access(host_req);
                 break;
-            }
             default:
                 throw ConfigurationError("AiMDRAMSystem: memory access region {}!", (int)host_req.mem_access_region);
             }
@@ -409,22 +428,18 @@ public:
         }
         case Type::Write: {
             switch (host_req.mem_access_region) {
-            case MemAccessRegion::CFR: {
+            case MemAccessRegion::CFR:
+                // CFR writes update simulator-internal config state immediately.
                 if (address_to_CFR.find(host_req.addr) == address_to_CFR.end())
                     throw ConfigurationError("AiMDRAMSystem: unknown CFR at location {}!", (int)host_req.addr);
                 CFR_values[address_to_CFR[host_req.addr]] = host_req.data;
                 break;
-            }
             case MemAccessRegion::GPR:
+                // GPR writes are a host-side register file; not modeled here.
                 break;
-            case MemAccessRegion::MEM: {
-                Request aim_req = host_req;
-                aim_req.AiM_req_id = AiM_req_id++;
-                apply_addr_mapp(aim_req, aim_req.channel_mask);
-                int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
-                channel_pending_queues[channel_id].push(aim_req);
+            case MemAccessRegion::MEM:
+                decompose_mem_access(host_req);
                 break;
-            }
             default:
                 throw ConfigurationError("AiMDRAMSystem: memory access region {}!", (int)host_req.mem_access_region);
             }
@@ -436,6 +451,15 @@ public:
     }
 
     void tick() override {
+        // Count cycles in which the DMA is parked waiting on a blocking read
+        // somewhere — i.e. any channel has an in-flight blocking aim_req.
+        for (int ch = 0; ch < (int)m_controllers.size(); ch++) {
+            if (stalls[ch] > 0) {
+                s_wait_RD_stall++;
+                break;
+            }
+        }
+
         // Phase 1: decompose one host_req from host_request_queue
         if (!host_request_queue.empty()) {
             decompose(host_request_queue.front());

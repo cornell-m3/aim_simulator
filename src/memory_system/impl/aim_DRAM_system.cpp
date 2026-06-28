@@ -14,7 +14,12 @@
 namespace Ramulator {
 
 #define ISR_SIZE (1 << 21)
-#define MAX_CHANNEL_COUNT 32
+// Channel mask is encoded in the lower 32 bits of an int64_t throughout the
+// trace format and the dispatch path. Bits 32+ are reserved.
+static constexpr int kChannelMaskWidth = 32;
+// Synthetic row address used to route ISR_AF aim_reqs. ISR_AF doesn't have a
+// real row in the trace; this base + AFM selects the activation-function LUT row.
+static constexpr int kAFRowBase = 1 << 29;
 
 // Design D: design B's per-channel pipeline + design C's required-channels
 // FIFO join. The cleanest of the four implementations on both axes:
@@ -58,8 +63,9 @@ protected:
 
     // Host requests as they arrive from the frontend; one is decomposed per tick.
     std::queue<Request> host_request_queue;
-    // Per-channel FIFO of aim_reqs awaiting controller send.
-    std::queue<Request> channel_pending_queues[MAX_CHANNEL_COUNT];
+    // Per-channel FIFO of aim_reqs awaiting controller send. Sized to the actual
+    // number of DRAM channels in init().
+    std::vector<std::queue<Request>> channel_pending_queues;
     int AiM_req_id = 0;
 
     // stalls[ch] = number of in-flight blocking aim_reqs on channel ch.
@@ -94,21 +100,23 @@ protected:
 
         uint8_t count = 0;
 
-        for (int i = 0; i < MAX_CHANNEL_COUNT; i++)
-            if (ch_mask & (0x1 << i))
+        for (int i = 0; i < kChannelMaskWidth; i++)
+            if (ch_mask & (1LL << i))
                 count++;
 
         return count;
     }
 
+    // Pops the lowest set bit of ch_mask and returns its index in [0, 31].
+    // Caller must ensure at least one bit is set.
     uint8_t FindFirstChannelIndex(int64_t &ch_mask) const {
-        uint32_t ch_mask_u = ch_mask;
-        assert(ch_mask_u & 0xffffffff != 0);
+        uint64_t ch_mask_u = static_cast<uint64_t>(ch_mask);
+        assert((ch_mask_u & 0xffffffffULL) != 0);
 
-        for (int i = 0; i < MAX_CHANNEL_COUNT; i++) {
-            if (ch_mask_u & (0x1 << i)) {
-                ch_mask_u &= ~(0x1 << i);
-                ch_mask = ch_mask_u;
+        for (int i = 0; i < kChannelMaskWidth; i++) {
+            if (ch_mask_u & (1ULL << i)) {
+                ch_mask_u &= ~(1ULL << i);
+                ch_mask = static_cast<int64_t>(ch_mask_u);
                 return i;
             }
         }
@@ -119,9 +127,9 @@ protected:
 
     void apply_addr_mapp(Request &req, int channel_id) {
         req.addr_vec.resize(m_num_levels, -1);
-        if ((channel_id < 0) || (channel_id >= MAX_CHANNEL_COUNT)) {
-            m_logger->error("{} has CH more than {}!", req.str(), MAX_CHANNEL_COUNT);
-            exit(-1);
+        if (channel_id < 0 || channel_id >= (int)m_controllers.size()) {
+            throw ConfigurationError("AiMDRAMSystem: {} targets channel {} but only {} channels exist!",
+                                     req.str(), channel_id, m_controllers.size());
         }
         req.addr_vec[m_dram->m_levels("channel")] = channel_id;
         if (m_has_rank) {
@@ -131,12 +139,15 @@ protected:
             req.addr_vec[m_dram->m_levels("bankgroup")] = -1;
             req.addr_vec[m_dram->m_levels("bank")] = -1;
         } else {
-            if ((req.bank_index < 0) || (req.bank_index >= 16)) {
-                m_logger->error("{} has BA more than 16!", req.str());
-                exit(-1);
+            const int banks_per_group = m_dram->get_level_size("bank");
+            const int total_banks =
+                m_dram->get_level_size("bankgroup") * banks_per_group;
+            if (req.bank_index < 0 || req.bank_index >= total_banks) {
+                throw ConfigurationError("AiMDRAMSystem: {} bank index {} out of range [0, {})!",
+                                         req.str(), req.bank_index, total_banks);
             }
-            req.addr_vec[m_dram->m_levels("bankgroup")] = req.bank_index / 4;
-            req.addr_vec[m_dram->m_levels("bank")] = req.bank_index % 4;
+            req.addr_vec[m_dram->m_levels("bankgroup")] = req.bank_index / banks_per_group;
+            req.addr_vec[m_dram->m_levels("bank")] = req.bank_index % banks_per_group;
         }
         req.addr_vec[m_dram->m_levels("row")] = req.row_addr;
         req.addr_vec[m_dram->m_levels("column")] = req.col_addr;
@@ -168,15 +179,19 @@ public:
         }
 
         int num_channels = m_dram->get_level_size("channel");
+        if (num_channels > kChannelMaskWidth) {
+            throw ConfigurationError("AiMDRAMSystem: num_channels {} exceeds 32-bit channel mask width!", num_channels);
+        }
 
         // Create memory controllers
+        channel_pending_queues.resize(num_channels);
+        stalls.assign(num_channels, 0);
+        last_completed_host_id.assign(num_channels, -1);
         for (int i = 0; i < num_channels; i++) {
             IDRAMController *controller = create_child_ifce<IDRAMController>();
             controller->m_impl->set_id(fmt::format("Channel {}", i));
             controller->m_channel_id = i;
             m_controllers.push_back(controller);
-            stalls.push_back(0);
-            last_completed_host_id.push_back(-1);
         }
 
         m_clock_ratio = param<uint>("clock_ratio").required();
@@ -316,7 +331,7 @@ public:
 
                 if (opcode == Opcode::ISR_AF) {
                     aim_req.afm = CFR_values[CFR::AFM];
-                    aim_req.row_addr = (1 << 29) + aim_req.afm;
+                    aim_req.row_addr = kAFRowBase + aim_req.afm;
                 }
 
                 if (host_req.opcode == Opcode::ISR_MAC_ABK || host_req.opcode == Opcode::ISR_MAC_SBK)
@@ -342,8 +357,6 @@ public:
                         aim_req.AiM_req_id = AiM_req_id++;
                         aim_req.host_req_id = host_req.host_req_id;
                         apply_addr_mapp(aim_req, channel_id);
-                        assert(channel_id < m_controllers.size());
-                        assert(channel_id < MAX_CHANNEL_COUNT);
                         channel_pending_queues[channel_id].push(aim_req);
                     }
                 }

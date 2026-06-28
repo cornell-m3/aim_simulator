@@ -402,7 +402,7 @@ public:
 
         bool all_free = true;
         for (int ch = 0; ch < (int)m_controllers.size(); ch++) {
-            if (stalls[ch]) {
+            if (stalls[ch] != 0 || !remaining_AiM_requests[ch].empty()) {
                 all_free = false;
                 break;
             }

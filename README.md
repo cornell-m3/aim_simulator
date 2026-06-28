@@ -96,6 +96,10 @@ Please refer to `test/example.yaml` to find a config file example.
 
 **NOTE:** The current version of AiM simulator supports 32 channels (this is not configurable).
 
+## Design notes
+
+The AiM memory system pipeline, the four decouple-stalls designs (A/B/C/D), and the scaling experiments are documented in [`docs/AIM_MEMORY_SYSTEM.md`](docs/AIM_MEMORY_SYSTEM.md). See also `test/run_regression.sh`, `test/scaling_table.sh`, and the gtest suite at `src/memory_system/impl/aim_DRAM_system_test.cpp`.
+
 ## Citation
 
 If you use AiM simulator, please cite the following paper as well as Ramulator 2.0 [5]:

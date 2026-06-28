@@ -3,6 +3,7 @@
 #include "base/type.h"
 #include "dram/dram.h"
 #include "dram_controller/controller.h"
+#include "memory_system/impl/aim_channel_mask.h"
 #include "memory_system/memory_system.h"
 #include "translation/translation.h"
 #include <cassert>
@@ -14,9 +15,6 @@
 namespace Ramulator {
 
 #define ISR_SIZE (1 << 21)
-// Channel mask is encoded in the lower 32 bits of an int64_t throughout the
-// trace format and the dispatch path. Bits 32+ are reserved.
-static constexpr int kChannelMaskWidth = 32;
 // Synthetic row address used to route ISR_AF aim_reqs. ISR_AF doesn't have a
 // real row in the trace; this base + AFM selects the activation-function LUT row.
 static constexpr int kAFRowBase = 1 << 29;
@@ -96,33 +94,11 @@ protected:
     std::map<Addr_t, CFR> address_to_CFR;
 
     uint8_t CountSetBit(const int64_t ch_mask) const {
-        assert(ch_mask > 0);
-
-        uint8_t count = 0;
-
-        for (int i = 0; i < kChannelMaskWidth; i++)
-            if (ch_mask & (1LL << i))
-                count++;
-
-        return count;
+        return aim_channel_mask::count(ch_mask);
     }
 
-    // Pops the lowest set bit of ch_mask and returns its index in [0, 31].
-    // Caller must ensure at least one bit is set.
     uint8_t FindFirstChannelIndex(int64_t &ch_mask) const {
-        uint64_t ch_mask_u = static_cast<uint64_t>(ch_mask);
-        assert((ch_mask_u & 0xffffffffULL) != 0);
-
-        for (int i = 0; i < kChannelMaskWidth; i++) {
-            if (ch_mask_u & (1ULL << i)) {
-                ch_mask_u &= ~(1ULL << i);
-                ch_mask = static_cast<int64_t>(ch_mask_u);
-                return i;
-            }
-        }
-
-        assert(false);
-        return 0;
+        return aim_channel_mask::pop_lowest(ch_mask);
     }
 
     void apply_addr_mapp(Request &req, int channel_id) {
@@ -179,7 +155,7 @@ public:
         }
 
         int num_channels = m_dram->get_level_size("channel");
-        if (num_channels > kChannelMaskWidth) {
+        if (num_channels > aim_channel_mask::kWidth) {
             throw ConfigurationError("AiMDRAMSystem: num_channels {} exceeds 32-bit channel mask width!", num_channels);
         }
 
@@ -282,7 +258,7 @@ public:
     // required_channels mask of an all-channel barrier (ISR_SYNC / ISR_EOC).
     int64_t all_channels_mask() const {
         const size_t n = m_controllers.size();
-        return n >= kChannelMaskWidth ? -1LL : ((1LL << n) - 1);
+        return n >= aim_channel_mask::kWidth ? -1LL : ((1LL << n) - 1);
     }
 
     // Decompose an ISR_SYNC / ISR_EOC host_req: push one blocking aim_req per

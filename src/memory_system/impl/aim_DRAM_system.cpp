@@ -59,8 +59,12 @@ protected:
     std::vector<IDRAMController *> m_controllers;
     Logger_t m_logger;
 
-    // Host requests as they arrive from the frontend; one is decomposed per tick.
+    // Host requests as they arrive from the frontend. Up to m_decompose_budget
+    // are decomposed per tick, gated by the disjoint-channel-mask constraint
+    // (two ISRs that touch the same channel cannot be co-issued in one tick).
     std::queue<Request> host_request_queue;
+    // Per-tick decompose width. 0 = sentinel for "auto = num_channels", resolved in init().
+    int m_decompose_budget = 0;
     // Per-channel FIFO of aim_reqs awaiting controller send. Sized to the actual
     // number of DRAM channels in init().
     std::vector<std::queue<Request>> channel_pending_queues;
@@ -172,6 +176,11 @@ public:
 
         m_clock_ratio = param<uint>("clock_ratio").required();
 
+        m_decompose_budget = param<int>("decompose_budget")
+            .desc("Max host_reqs decomposed per tick (disjoint channel masks). 0 = num_channels.")
+            .default_val(0);
+        if (m_decompose_budget <= 0) m_decompose_budget = num_channels;
+
         // vector data for MAC is from GB (0) or next bank (1)
         address_to_CFR[0] = CFR::BROADCAST;
         CFR_values[CFR::BROADCAST] = 0;
@@ -259,6 +268,24 @@ public:
     int64_t all_channels_mask() const {
         const size_t n = m_controllers.size();
         return n >= aim_channel_mask::kWidth ? -1LL : ((1LL << n) - 1);
+    }
+
+    // Channel mask a host_req would touch during decompose. Used by Phase 1's
+    // disjoint-mask check to decide whether two host_reqs can co-issue. CFR/GPR
+    // accesses and ISR_EWADD return 0 (they generate no aim_req); SYNC/EOC return
+    // the full mask (they fan out to every channel).
+    int64_t effective_mask(const Request &req) const {
+        if (req.type == Type::AIM) {
+            if (req.opcode == Opcode::ISR_SYNC || req.opcode == Opcode::ISR_EOC)
+                return all_channels_mask();
+            if (req.opcode == Opcode::ISR_EWADD)
+                return 0;
+            return req.channel_mask;
+        }
+        if (req.mem_access_region == MemAccessRegion::CFR ||
+            req.mem_access_region == MemAccessRegion::GPR)
+            return 0;
+        return 1LL << req.channel_mask;
     }
 
     // Decompose an ISR_SYNC / ISR_EOC host_req: push one blocking aim_req per
@@ -436,10 +463,21 @@ public:
             }
         }
 
-        // Phase 1: decompose one host_req from host_request_queue
-        if (!host_request_queue.empty()) {
-            decompose(host_request_queue.front());
-            host_request_queue.pop();
+        // Phase 1: decompose up to m_decompose_budget host_reqs from
+        // host_request_queue, stopping when the next head would race on a
+        // channel already taken this tick (disjoint-channel-mask constraint).
+        // CFR/GPR writes and ISR_EWADD have effective_mask == 0 — they consume
+        // a budget slot but pin no channel, so they coexist freely.
+        {
+            int64_t mask_taken = 0;
+            for (int i = 0; i < m_decompose_budget && !host_request_queue.empty(); i++) {
+                const Request &front = host_request_queue.front();
+                int64_t m = effective_mask(front);
+                if (m != 0 && (m & mask_taken) != 0) break;
+                decompose(front);
+                host_request_queue.pop();
+                mask_taken |= m;
+            }
         }
 
         // Phase 2: drain per-channel queues

@@ -9,7 +9,9 @@
 
 #include "base/exception.h"
 #include "base/request.h"
+#include "dram/dram.h"
 #include "frontend/frontend.h"
+#include "memory_system/memory_system.h"
 
 namespace Ramulator {
 
@@ -43,6 +45,9 @@ private:
 
     bool delimiter_is_comma = false;
 
+    // Per-tick fetch width. 0 = sentinel for "auto = num_channels", resolved in setup().
+    int m_fetch_budget = 0;
+
 public:
     void init() override {
         std::string trace_path_str = param<std::string>("path")
@@ -54,6 +59,10 @@ public:
                                         .default_val(" ");
 
         m_clock_ratio = param<uint>("clock_ratio").required();
+
+        m_fetch_budget = param<int>("fetch_budget")
+                             .desc("Max trace lines fetched + sent per tick. 0 = num_channels.")
+                             .default_val(0);
 
         assert(delimiter_str.length() == 1);
         if (delimiter_str == ",")
@@ -70,15 +79,24 @@ public:
         callback = std::bind(&AiMTrace::receive, this, std::placeholders::_1);
     };
 
-    void tick() override {
-        if ((remaining_req == false) && (m_trace_reached_EOC == false)) {
-            AiMTrace_request = get_host_request();
-            remaining_req = true;
+    void setup(IFrontEnd *frontend, IMemorySystem *memory_system) override {
+        if (m_fetch_budget <= 0) {
+            m_fetch_budget = memory_system->get_ifce<IDRAM>()->get_level_size("channel");
         }
-        if (remaining_req == true) {
-            bool request_sent = m_memory_system->send(AiMTrace_request);
-            if (request_sent)
-                remaining_req = false;
+    }
+
+    void tick() override {
+        // Fetch + send up to m_fetch_budget host_reqs this tick. Models a host
+        // port of that width; pair with MemorySystem.decompose_budget so the
+        // dispatch pipeline isn't starved or backed up asymmetrically.
+        for (int i = 0; i < m_fetch_budget; i++) {
+            if (remaining_req == false && m_trace_reached_EOC == false) {
+                AiMTrace_request = get_host_request();
+                remaining_req = true;
+            }
+            if (remaining_req == false) break;                                // EOC reached
+            if (m_memory_system->send(AiMTrace_request) == false) break;      // backpressure
+            remaining_req = false;
         }
     };
 

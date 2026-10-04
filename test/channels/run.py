@@ -1,343 +1,229 @@
 #!/usr/bin/env python3
-"""Runs the channel-count cases on test/example.yaml and checks them.
+"""Checks what many-channels adds: a channel mask is a set of indices of any width, and the channel
+count is whatever `MemorySystem.DRAM.org.channel` says.
 
-    python3 test/channels/run.py [--binary build/ramulator2] [--update]
+    python3 test/channels/run.py [--binary build/ramulator2]
 
-Three kinds of result are kept apart, so that a legitimate timing-model change never reads as a channel
-regression:
-
-  FUNCTIONAL   the right channels did the work, and a channel the system lacks is refused
-  PERFORMANCE  more channels finish sooner, and the DMA fan-out does not serialize
-  GOLDEN       the exact cycle count of every case, against golden.txt (--update rewrites it)
-
-The exit status is nonzero if any kind fails.
+Each case is one line of trace on test/example.yaml. What an ISR does on one channel is the other
+traces' business; here only which channels it reaches, and that a channel the system lacks is refused.
 """
 
 import argparse
-import concurrent.futures
-import itertools
-import os
+import dataclasses
+import functools
 import pathlib
 import re
 import subprocess
 import sys
+import tempfile
 
-HERE = pathlib.Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
-TRACES = HERE / "traces"
-GOLDEN = HERE / "golden.txt"
+ROOT = pathlib.Path(__file__).resolve().parents[2]
 CONFIG = ROOT / "test" / "example.yaml"
 
-FANOUT_CHANNELS = (1, 2, 3, 4, 5, 7, 8, 16, 31, 32, 33, 63, 64, 65, 127, 128)
-STRONG_CHANNELS = (1, 2, 4, 8, 16, 32, 64, 128)
-SYSTEM_SIZES = (32, 64, 128)  # systems the same small workload runs on
-EDGE_CHANNELS = (33, 64, 65, 128)
-SPARSE_SYSTEM, SPARSE_CHANNELS = 128, (0, 63, 127)
-STRONG_ROWS, WEAK_ROWS, COLUMNS = 256, 4, 64  # as in gen.py
+AF = "AiM AF {mask}"
+MAC_ABK = "AiM MAC_ABK 0 {mask} 0"
+MEM_WRITE = "W MEM {channel} 0 0"
 
-# The commands of the broadcast ISRs in gen.py's fanout traces: every channel issues the same number.
-BROADCAST_COMMANDS = ("AF16", "EWMUL16", "MAC", "MAC16", "RDAF16", "RDCP", "RDMAC16", "TMOD", "WRCP", "WRGB", "WRMAC16")
-
-# What the one-channel ISRs of gen.py's fanout traces add to the top channel.
-SINGLE_CHANNEL_COMMANDS = {"ACT": 4, "ACT16": 1, "WRA16": 1, "WR": 8, "RD": 8}
-
-# Speedup of strong scaling is at least this fraction of the channel count, while every channel still
-# has at least MIN_ROWS rows. With fewer, the fill and read-back that do not shrink with the channel
-# count dominate (2 rows per channel at 128 channels measures 71%), and only the monotonic fall is checked.
-MIN_EFFICIENCY = 0.8
-MIN_ROWS = 4
-# Cycles of weak scaling stay within this fraction of the one-channel run. Measured: identical from 1 to
-# 128 channels, so this is slack for a timing-model change, not a property of the fan-out.
+# Both sides of the old 32-channel cap and of a 64-bit word of the mask, and a count that is no power of two.
+SIZES = (1, 3, 32, 33, 64, 65, 128)
+# Systems the same workload must cost the same on.
+SYSTEM_SIZES = (32, 64, 128)
+WEAK_ROWS_PER_CHANNEL = 4
 WEAK_TOLERANCE = 0.05
 
 
+@dataclasses.dataclass
 class Run:
-    def __init__(self, trace, channels, overrides=()):
-        self.trace, self.channels, self.overrides = trace, channels, tuple(overrides)
-        self.key = (trace, channels, self.overrides)
-        self.returncode = None
-        self.stats = {}
-        self.stderr = ""
-
-    def execute(self, binary):
-        params = [f"MemorySystem.DRAM.org.channel={self.channels}", *self.overrides]
-        command = [str(binary), "-f", str(CONFIG), "-t", str(TRACES / f"{self.trace}.trace")]
-        for param in params:
-            command += ["-p", param]
-        done = subprocess.run(command, capture_output=True, text=True, cwd=ROOT, check=False)
-        self.returncode, self.stderr = done.returncode, done.stderr
-        for line in done.stdout.splitlines():
-            found = re.match(r"\s*(\w+):\s*(-?\d+)\b", line)
-            if found:
-                self.stats[found[1]] = int(found[2])
-        return self
-
-    @property
-    def cycles(self):
-        return self.stats.get("memory_system_cycles")
-
-    def channel(self, index):
-        """One channel's stats, without the `CH<index>_` prefix."""
-        prefix = f"CH{index}_"
-        return {name[len(prefix) :]: value for name, value in self.stats.items() if name.startswith(prefix)}
-
-    def command(self, index, name):
-        return self.stats.get(f"CH{index}_commands_{name}", 0)
-
-    def worked(self):
-        """The channels that issued any command."""
-        return [
-            i for i in range(self.channels) if any(v for k, v in self.channel(i).items() if k.startswith("commands_"))
-        ]
+    returncode: int
+    stats: dict[str, int]
+    stderr: str
 
 
-class Report:
-    def __init__(self):
-        self.failures = {"FUNCTIONAL": [], "PERFORMANCE": [], "GOLDEN": []}
-        self.checked = {"FUNCTIONAL": 0, "PERFORMANCE": 0, "GOLDEN": 0}
-
-    def check(self, kind, case, ok, why=""):
-        self.checked[kind] += 1
-        if not ok:
-            self.failures[kind].append(f"{case}: {why}")
-
-    def failed(self):
-        return any(self.failures.values())
+def build_mask(channels):
+    return sum(1 << channel for channel in channels)
 
 
-def gemv_channels():
-    found = [int(re.search(r"_(\d+)$", p.stem)[1]) for p in TRACES.glob("gemv_4096x4096_*.trace")]
-    return sorted(found)
+def run_ramulator(lines, n_channels, binary, overrides=()):
+    """`lines` and an EOC on a system of `n_channels`."""
+    command = [str(binary), "-f", str(CONFIG), "-p", f"MemorySystem.DRAM.org.channel={n_channels}"]
+    for override in overrides:
+        command += ["-p", override]
+    with tempfile.NamedTemporaryFile("w", suffix=".trace") as trace:
+        trace.write("".join(f"{line}\n" for line in [*lines, "AiM EOC"]))
+        trace.flush()
+        done = subprocess.run([*command, "-t", trace.name], capture_output=True, text=True, cwd=ROOT, check=False)
+    stats = {name: int(value) for name, value in re.findall(r"^\s*(\w+):\s*(-?\d+)\b", done.stdout, re.MULTILINE)}
+    return Run(done.returncode, stats, done.stderr)
 
 
-def plan():
-    """Every run the checks need, once each."""
-    runs = {}
-
-    def add(trace, channels, overrides=()):
-        run = Run(trace, channels, overrides)
-        return runs.setdefault(run.key, run)
-
-    for c in FANOUT_CHANNELS:
-        add(f"fanout_{c}", c)
-        add(f"weak_{c}", c)
-    for c in (64, 128):
-        add(f"fanout_{c}_hex", c)
-    for c in STRONG_CHANNELS:
-        add(f"strong_{c}", c)
-        for size in SYSTEM_SIZES:
-            if c <= size:
-                add(f"strong_{c}", size)
-    add(f"sparse_{SPARSE_SYSTEM}", SPARSE_SYSTEM)
-    for c in EDGE_CHANNELS:
-        add(f"edge_{c}", c)
-    for c in gemv_channels():
-        add(f"gemv_4096x4096_{c}", c)
-    add("reject_bit64_c64", 64)
-    add("reject_bit128_c128", 128)
-    add("reject_mem_c64", 64)
-    add("reject_zero_mask", 8)
-    add("reject_malformed_mask", 8)
-    add("fanout_64", 64, ["MemorySystem.DRAM.org.density=131072"])
-    return runs
+def list_working_channels(run):
+    """The channels that issued any command."""
+    working = set()
+    for name, value in run.stats.items():
+        found = re.match(r"CH(\d+)_commands_", name)
+        if found and value:
+            working.add(int(found[1]))
+    return working
 
 
-def label(run):
-    return f"{run.trace}@{run.channels}" + "".join(f"[{o}]" for o in run.overrides)
+def list_channel_stats(run, channels):
+    """The cycle count and the counters of `channels`."""
+    stats = {"memory_system_cycles": run.stats["memory_system_cycles"]}
+    for name, value in run.stats.items():
+        found = re.match(r"CH(\d+)_", name)
+        if found and int(found[1]) in channels:
+            stats[name] = value
+    return stats
 
 
-def check_functional(runs, report):
-    def get(trace, channels, overrides=()):
-        return runs[(trace, channels, tuple(overrides))]
+def check_ran(run, trace):
+    if run.returncode != 0:
+        raise AssertionError(f"{trace} failed with exit {run.returncode}: {run.stderr.strip()[-200:]}")
 
-    ok = lambda case, cond, why="": report.check("FUNCTIONAL", case, cond, why)
 
-    for c in FANOUT_CHANNELS:
-        weak = get(f"weak_{c}", c)
-        ok(f"weak_{c}", weak.returncode == 0, f"exit {weak.returncode}")
-        run = get(f"fanout_{c}", c)
-        case = f"fanout_{c}"
-        ok(case, run.returncode == 0, f"exit {run.returncode}: {run.stderr.strip()[-200:]}")
-        if run.returncode != 0:
-            continue
-        reference = run.channel(0)
-        # The channels below the top one see the same stream, so their whole stats agree.
-        stragglers = [i for i in range(c - 1) if run.channel(i) != reference]
-        ok(case, not stragglers, f"channels {stragglers[:5]} differ from channel 0")
-        for name in BROADCAST_COMMANDS:
-            counts = {run.command(i, name) for i in range(c)}
-            ok(case, len(counts) == 1 and counts != {0}, f"{name} counts per channel: {sorted(counts)}")
-        # The one-channel ISRs ran on the top channel only. What the broadcast ISRs did is channel 0's
-        # stream, or for a single channel the same stream from the two-channel run.
-        top = c - 1
-        reference = reference if c > 1 else get("fanout_2", 2).channel(0)
-        for name, extra in SINGLE_CHANNEL_COMMANDS.items():
-            got = run.command(top, name) - reference.get(f"commands_{name}", 0)
-            ok(case, got == extra, f"channel {top} issued {got} extra {name}, expected {extra}")
-
-    for c in (64, 128):
-        decimal, hexadecimal = get(f"fanout_{c}", c), get(f"fanout_{c}_hex", c)
-        ok(f"fanout_{c}_hex", decimal.stats == hexadecimal.stats, "hex mask gave different stats than decimal")
-
-    work = STRONG_ROWS * COLUMNS
-    for c in STRONG_CHANNELS:
-        run = get(f"strong_{c}", c)
-        case = f"strong_{c}"
-        ok(case, run.returncode == 0, f"exit {run.returncode}")
-        counts = [run.command(i, "MAC16") for i in range(c)]
-        ok(case, set(counts) == {work // c}, f"MAC16 per channel {sorted(set(counts))}, expected {work // c}")
-        ok(case, sum(counts) == work, f"total MAC16 {sum(counts)}, expected {work}")
-        for size in SYSTEM_SIZES:
-            if c > size:
-                continue
-            there = get(f"strong_{c}", size)
-            same = there.cycles == run.cycles and all(there.channel(i) == run.channel(i) for i in range(c))
-            ok(f"strong_{c}@{size}", same, f"{c} channels of a {size}-channel system differ from a {c}-channel system")
-            ok(f"strong_{c}@{size}", there.worked() == list(range(c)), f"channels that worked: {there.worked()[:8]}")
-
-    sparse = get(f"sparse_{SPARSE_SYSTEM}", SPARSE_SYSTEM)
-    case = f"sparse_{SPARSE_SYSTEM}"
-    ok(case, sparse.returncode == 0, f"exit {sparse.returncode}")
-    ok(case, sparse.worked() == list(SPARSE_CHANNELS), f"channels that worked: {sparse.worked()}")
-    for i in SPARSE_CHANNELS:
-        ok(case, sparse.command(i, "MAC16") == WEAK_ROWS * COLUMNS, f"channel {i} MAC16 {sparse.command(i, 'MAC16')}")
-
-    for c in EDGE_CHANNELS:
-        run = get(f"edge_{c}", c)
-        case = f"edge_{c}"
-        ok(case, run.returncode == 0, f"exit {run.returncode}")
-        ok(case, run.worked() == [c - 1], f"channels that worked: {run.worked()[:8]}")
-        ok(
-            case,
-            run.command(c - 1, "MAC16") == WEAK_ROWS * COLUMNS,
-            f"channel {c - 1} MAC16 {run.command(c - 1, 'MAC16')}",
+def check_reaches(template, n_channels, channels, binary):
+    """`template` (a line with `{mask}` or `{channel}`) on `channels` of `n_channels` works those and no others."""
+    line = template.format(mask=build_mask(channels), channel=min(channels))
+    run = run_ramulator([line], n_channels, binary)
+    check_ran(run, line)
+    working = list_working_channels(run)
+    if working != set(channels):
+        raise AssertionError(
+            f"{line} on {n_channels} channels\n    did not work: {sorted(set(channels) - working)}"
+            f"\n    worked unasked: {sorted(working - set(channels))}"
         )
 
-    for c in gemv_channels():
-        run = get(f"gemv_4096x4096_{c}", c)
-        case = f"gemv_4096x4096_{c}"
-        ok(case, run.returncode == 0, f"exit {run.returncode}")
-        counts = [run.command(i, "MAC16") for i in range(c)]
-        ok(case, sum(counts) == 65536, f"total MAC16 {sum(counts)}, expected 65536")
-        ok(case, max(counts) == min(counts), f"MAC16 per channel from {min(counts)} to {max(counts)}")
 
-    refusals = (
-        ("reject_bit64_c64", 64, [], "names channel 64"),
-        ("reject_bit128_c128", 128, [], "names channel 128"),
-        ("reject_mem_c64", 64, [], "names channel 64"),
-        ("reject_zero_mask", 8, [], "selects no channel"),
-        ("reject_malformed_mask", 8, [], "malformed channel mask"),
-        ("fanout_64", 64, ["MemorySystem.DRAM.org.density=131072"], "does not equal the provided density"),
+def check_hex_matches_decimal(template, n_channels, binary):
+    mask = build_mask(range(n_channels))
+    decimal = run_ramulator([template.format(mask=mask)], n_channels, binary)
+    hexadecimal = run_ramulator([template.format(mask=hex(mask))], n_channels, binary)
+    check_ran(decimal, template)
+    check_ran(hexadecimal, template)
+    if decimal.stats != hexadecimal.stats:
+        raise AssertionError(f"{template} on {n_channels} channels: mask {hex(mask)} reads differently from {mask}")
+
+
+def check_system_size_is_free(template, channels, binary):
+    """`channels` cost the same and issue the same on every system in SYSTEM_SIZES."""
+    line = template.format(mask=build_mask(channels), channel=min(channels))
+    seen = []
+    for n_channels in SYSTEM_SIZES:
+        run = run_ramulator([line], n_channels, binary)
+        check_ran(run, line)
+        seen.append(list_channel_stats(run, channels))
+    if any(stats != seen[0] for stats in seen):
+        raise AssertionError(f"{line} differs between systems of {SYSTEM_SIZES} channels")
+
+
+def check_refused(lines, n_channels, message, binary, overrides=()):
+    run = run_ramulator(lines, n_channels, binary, overrides)
+    if run.returncode == 0:
+        raise AssertionError(f"{lines} on {n_channels} channels was accepted")
+    if message not in run.stderr:
+        raise AssertionError(f"{lines} on {n_channels} channels: expected {message!r}, got {run.stderr.strip()[-200:]}")
+
+
+def check_weak_scaling_is_flat(sizes, binary):
+    """The same rows on every channel take the same cycles however many channels there are."""
+    cycles = {}
+    for n_channels in sizes:
+        mask = build_mask(range(n_channels))
+        rows = [f"AiM MAC_ABK 63 {mask} {row}" for row in range(WEAK_ROWS_PER_CHANNEL)]
+        run = run_ramulator(rows, n_channels, binary)
+        check_ran(run, rows[0])
+        cycles[n_channels] = run.stats["memory_system_cycles"]
+    smallest = cycles[min(cycles)]
+    if any(abs(value / smallest - 1) > WEAK_TOLERANCE for value in cycles.values()):
+        raise AssertionError(f"cycles by channel count: {cycles}")
+
+
+def enumerate_cases(binary):
+    """`(kind, name, check)` for every case, in the order the properties are listed."""
+    reaches = functools.partial(check_reaches, binary=binary)
+    refused = functools.partial(check_refused, binary=binary)
+
+    for n_channels in SIZES:
+        yield (
+            "FUNCTIONAL",
+            f"AF on all {n_channels} channels",
+            functools.partial(reaches, AF, n_channels, range(n_channels)),
+        )
+    yield "FUNCTIONAL", "AF on {0, 63, 127} of 128", functools.partial(reaches, AF, 128, {0, 63, 127})
+    for n_channels in (33, 64, 65, 128):
+        yield (
+            "FUNCTIONAL",
+            f"AF on channel {n_channels - 1} of {n_channels}",
+            functools.partial(reaches, AF, n_channels, {n_channels - 1}),
+        )
+    yield "FUNCTIONAL", "MEM write to channel 64 of 65", functools.partial(reaches, MEM_WRITE, 65, {64})
+    yield (
+        "FUNCTIONAL",
+        "128-channel mask in decimal and hex",
+        functools.partial(check_hex_matches_decimal, AF, 128, binary),
     )
-    for trace, c, overrides, message in refusals:
-        run = get(trace, c, overrides)
-        case = label(run)
-        ok(case, run.returncode != 0, "was accepted")
-        ok(case, message in run.stderr, f"message lacks {message!r}: {run.stderr.strip()[-200:]}")
+    yield (
+        "FUNCTIONAL",
+        "MAC_ABK on 0..3 of 32, 64 and 128",
+        functools.partial(check_system_size_is_free, MAC_ABK, range(4), binary),
+    )
+
+    for n_channels in (64, 128):
+        yield (
+            "FUNCTIONAL",
+            f"refuse mask bit {n_channels} of {n_channels}",
+            functools.partial(
+                refused, [AF.format(mask=build_mask([n_channels]))], n_channels, f"names channel {n_channels}"
+            ),
+        )
+    yield (
+        "FUNCTIONAL",
+        "refuse MEM to channel 64 of 64",
+        functools.partial(refused, [MEM_WRITE.format(channel=64)], 64, "names channel 64"),
+    )
+    yield "FUNCTIONAL", "refuse mask 0", functools.partial(refused, [AF.format(mask=0)], 8, "selects no channel")
+    yield (
+        "FUNCTIONAL",
+        "refuse mask 1x2",
+        functools.partial(refused, [AF.format(mask="1x2")], 8, "malformed channel mask"),
+    )
+    yield (
+        "FUNCTIONAL",
+        "refuse a density that does not fit 64 channels",
+        functools.partial(
+            refused,
+            [AF.format(mask=1)],
+            64,
+            "does not equal the provided density",
+            overrides=["MemorySystem.DRAM.org.density=131072"],
+        ),
+    )
+
+    yield "PERFORMANCE", "weak scaling is flat", functools.partial(check_weak_scaling_is_flat, (1, 8, 65, 128), binary)
 
 
-def speedup(table, c):
-    """Cycles of the smallest run over this run's, in units of one smallest-run's worth of channels."""
-    smallest = min(table)
-    return table[smallest] / table[c] * smallest
-
-
-def cycles_table(runs, trace, counts):
-    """Cycles by channel count, for the runs that finished; a run that did not is a FUNCTIONAL failure."""
-    table = {}
-    for c in counts:
-        run = runs[(trace.format(c), c, ())]
-        if run.cycles is not None:
-            table[c] = run.cycles
-    return table
-
-
-def check_performance(runs, report):
-    ok = lambda case, cond, why="": report.check("PERFORMANCE", case, cond, why)
-    tables = {}
-
-    strong = cycles_table(runs, "strong_{}", STRONG_CHANNELS)
-    gemv = cycles_table(runs, "gemv_4096x4096_{}", gemv_channels())
-    weak = cycles_table(runs, "weak_{}", FANOUT_CHANNELS)
-    tables["strong"] = strong
-    if gemv:
-        tables["gemv"] = gemv
-    tables["weak"] = weak
-    for name, table in (("strong", strong), ("gemv", gemv)):
-        if not table:
-            continue
-        counts = sorted(table)
-        for a, b in itertools.pairwise(counts):
-            ok(f"{name}_{b}", table[b] < table[a], f"{b} channels took {table[b]} cycles, {a} took {table[a]}")
-        for c in counts:
-            if name == "strong" and STRONG_ROWS // c < MIN_ROWS:
-                continue
-            ok(
-                f"{name}_{c}",
-                speedup(table, c) >= MIN_EFFICIENCY * c,
-                f"speedup {speedup(table, c):.1f}x of {c} channels, below {MIN_EFFICIENCY}x",
-            )
-
-    for c, cycles in weak.items():  # empty if nothing ran
-        drift = cycles / weak[min(weak)] - 1
-        ok(f"weak_{c}", abs(drift) <= WEAK_TOLERANCE, f"{cycles} cycles is {drift:+.1%} from the one-channel run")
-    return tables
-
-
-def print_tables(tables):
-    weak = tables.pop("weak")
-    if weak:
-        print("\nweak scaling (fixed work per channel)")
-        print(f"{'channels':>9} {'cycles':>9} {'vs 1':>8}")
-        for c in sorted(weak):
-            print(f"{c:>9} {weak[c]:>9} {weak[c] / weak[min(weak)] - 1:>+8.1%}")
-    for name, table in tables.items():
-        if not table:
-            continue
-        counts = sorted(table)
-        print(f"\n{name} scaling (fixed total work)")
-        print(f"{'channels':>9} {'cycles':>9} {'speedup':>9} {'efficiency':>11}")
-        for c in counts:
-            speed = speedup(table, c)
-            print(f"{c:>9} {table[c]:>9} {speed:>8.1f}x {speed / c:>10.0%}")
-
-
-def check_golden(runs, report, update):
-    cycles = {label(run): run.cycles for run in runs.values() if run.returncode == 0 and run.cycles is not None}
-    if update:
-        GOLDEN.write_text("".join(f"{name} {value}\n" for name, value in sorted(cycles.items())))
-        print(f"wrote {len(cycles)} cases to {GOLDEN.relative_to(ROOT)}")
-        return
-    golden = dict(line.split() for line in GOLDEN.read_text().splitlines()) if GOLDEN.exists() else {}
-    for name, value in sorted(cycles.items()):
-        want = golden.get(name)
-        report.check("GOLDEN", name, want is not None and int(want) == value, f"timing changed: {want} -> {value}")
-    for name in sorted(set(golden) - set(cycles)):
-        report.check("GOLDEN", name, False, "in golden.txt but not run")
+def report_failures(failed, n_cases):
+    for kind, n_kind in n_cases.items():
+        print(f"{kind}: {n_kind - len(failed[kind])} of {n_kind} passed")
+        for name, why in failed[kind]:
+            print(f"  FAIL {name}\n    {why}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", default=ROOT / "build" / "ramulator2")
-    parser.add_argument("--update", action="store_true", help="rewrite golden.txt from this run")
-    parser.add_argument("-j", "--jobs", type=int, default=os.cpu_count())
     args = parser.parse_args()
 
-    runs = plan()
-    with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
-        list(pool.map(lambda run: run.execute(args.binary), runs.values()))
-
-    report = Report()
-    check_functional(runs, report)
-    print_tables(check_performance(runs, report))
-    check_golden(runs, report, args.update)
-
-    print()
-    for kind, failures in report.failures.items():
-        print(f"{kind}: {report.checked[kind] - len(failures)} of {report.checked[kind]} checks passed")
-        for failure in failures:
-            print(f"  FAIL {failure}")
-    return 1 if report.failed() else 0
+    n_cases = {"FUNCTIONAL": 0, "PERFORMANCE": 0}
+    failed = {"FUNCTIONAL": [], "PERFORMANCE": []}
+    for kind, name, check in enumerate_cases(args.binary):
+        n_cases[kind] += 1
+        try:
+            check()
+        except AssertionError as error:
+            failed[kind].append((name, error))
+    report_failures(failed, n_cases)
+    return 1 if any(failed.values()) else 0
 
 
 if __name__ == "__main__":

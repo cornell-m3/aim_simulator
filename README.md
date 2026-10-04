@@ -94,7 +94,20 @@ Build the simulator:
 
 Please refer to `test/example.yaml` to find a config file example.
 
-**NOTE:** The current version of AiM simulator supports 32 channels (this is not configurable).
+### Channels
+
+`test/example.yaml` has 32 channels. Set the count in the config (`MemorySystem.DRAM.org.channel: N`) or per run:
+```bash
+  $ ./build/ramulator2 -f test/example.yaml -t [your.trace] -p MemorySystem.DRAM.org.channel=64
+```
+Any positive count works. The density follows the channel count; give `density` explicitly only if it matches.
+
+`channel_mask` is a decimal or `0x` hex number of any length: bit *i* selects channel *i*. A mask or `MEM` access that names a channel the system lacks is an error.
+
+Check a build against any channel count (prints the scaling tables):
+```bash
+  $ python3 test/channels/run.py [--binary build/ramulator2] [--update]
+```
 
 ## Citation
 

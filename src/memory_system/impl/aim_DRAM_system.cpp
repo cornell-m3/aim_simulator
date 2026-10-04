@@ -398,7 +398,7 @@ public:
                         Request aim_req = host_req;
                         // aim_req.callback = callback;
                         aim_req.AiM_req_id = AiM_req_id++;
-                        apply_addr_mapp(aim_req, aim_req.channel_mask);
+                        apply_addr_mapp(aim_req, aim_req.channel_id);
                         int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
                         // m_logger->info("[CLK {}] 4- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
                         if (m_controllers[channel_id]->send(aim_req) == false) {
@@ -433,7 +433,7 @@ public:
                     case MemAccessRegion::MEM: {
                         Request aim_req = host_req;
                         aim_req.AiM_req_id = AiM_req_id++;
-                        apply_addr_mapp(aim_req, aim_req.channel_mask);
+                        apply_addr_mapp(aim_req, aim_req.channel_id);
                         int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
                         // m_logger->info("[CLK {}] 5- Sending {} to channel {}, channel_mask {}", m_clk, aim_req.str(), channel_id, aim_req.channel_mask);
                         if (m_controllers[channel_id]->send(aim_req) == false) {

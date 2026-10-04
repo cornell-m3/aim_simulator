@@ -46,9 +46,11 @@ std::string Request::str() {
         } else {
             req_stream << "Request[Type(Unknown), Region(";
         }
-        if (mem_access_region == MemAccessRegion::MEM)
+        if (mem_access_region == MemAccessRegion::MEM) {
             req_stream << "MEM), ";
-        else if (mem_access_region == MemAccessRegion::GPR)
+            if (channel_id != -1)
+                req_stream << "CH(" << channel_id << "), ";
+        } else if (mem_access_region == MemAccessRegion::GPR)
             req_stream << "GPR), ";
         else
             req_stream << "CFR), ";

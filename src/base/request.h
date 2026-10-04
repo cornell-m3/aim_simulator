@@ -99,6 +99,9 @@ struct Request {
     // Channel mask must show 1 channel in ISR_WR_ABK ISR
     int64_t channel_mask = -1;
 
+    // The channel a conventional R/W MEM access goes to.
+    int32_t channel_id = -1;
+
     // This request will be sent to a specific bank. USED only in single-bank ISRs, i.e.,
     // ISR_WR_SBK, ISR_RD_SBK, ISR_COPY_BKGB, ISR_COPY_GBBK, ISR_MAC_SBK, and ISR_EWMUL
     int16_t bank_index = -1;

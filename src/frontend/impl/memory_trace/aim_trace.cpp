@@ -222,7 +222,7 @@ private:
                         } else if (req.mem_access_region == MemAccessRegion::GPR) {
                             DECODE_AND_SET_FIELD(addr)
                         } else {
-                            DECODE_AND_SET_FIELD(channel_mask)
+                            DECODE_AND_SET_FIELD(channel_id)
                             DECODE_AND_SET_FIELD(bank_index)
                             DECODE_AND_SET_FIELD(row_addr)
                         }

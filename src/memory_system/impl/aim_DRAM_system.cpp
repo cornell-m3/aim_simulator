@@ -225,7 +225,7 @@ public:
                         refuse_channel(channels.back(), fmt::format("channel mask {}", host_req.channel_mask.str()));
                     }
                     Request aim_req = host_req;
-                    // Each per-channel request names its channel in addr_vec; the mask stays with the host request.
+                    // The host request owns the mask; each per-channel request names its channel in addr_vec.
                     aim_req.channel_mask = ChannelMask();
                     if (aim_req.opcode == Opcode::ISR_RD_SBK) {
                         aim_req.type = Type::Read;

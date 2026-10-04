@@ -552,25 +552,22 @@ private:
             m_organization.dq = *dq;
         }
 
-        bool counts_overridden = false;
+        bool has_count_override = false;
         for (int i = 0; i < m_levels.size(); i++) {
             auto level_name = m_levels(i);
             if (auto sz = param_group("org").param<int>(level_name).optional()) {
                 m_organization.count[i] = *sz;
-                counts_overridden = true;
+                has_count_override = true;
             }
         }
 
-        bool density_provided = false;
+        bool has_density = false;
         if (auto density = param_group("org").param<int>("density").optional()) {
             m_organization.density = *density;
-            density_provided = true;
+            has_density = true;
         }
 
-        // The density is the product of the counts. A preset's density only fits the preset's counts, so
-        // overriding a count (e.g. the channel count) without a density takes the density from the counts.
-        // The density feeds only the sanity check below and the tRFC lookup, which is inert here: there is
-        // no rank level, so all-bank refresh never issues.
+        // A preset's density fits only its own counts, so overriding a count without a density derives it.
         // Sanity check: is the calculated chip density the same as the provided one?
         size_t _density = size_t(m_organization.count[m_levels["channel"]]) *
                           size_t(m_organization.count[m_levels["bankgroup"]]) *
@@ -579,7 +576,7 @@ private:
                           size_t(m_organization.count[m_levels["column"]]) *
                           size_t(m_organization.dq);
         _density >>= 20;
-        if (counts_overridden && !density_provided) {
+        if (has_count_override && !has_density) {
             m_organization.density = _density;
         }
         if (m_organization.density != _density) {

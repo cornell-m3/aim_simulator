@@ -56,14 +56,14 @@ def run_ramulator(lines, n_channels, binary, overrides=()):
     return Run(done.returncode, stats, done.stderr)
 
 
-def list_working_channels(run):
-    """The channels that issued any command."""
-    working = set()
+def list_issuing_channels(run):
+    """The channels with at least one issued command, by Ramulator's `CH<i>_commands_*` stats."""
+    issuing = set()
     for name, value in run.stats.items():
         found = re.match(r"CH(\d+)_commands_", name)
         if found and value:
-            working.add(int(found[1]))
-    return working
+            issuing.add(int(found[1]))
+    return issuing
 
 
 def list_channel_stats(run, channels):
@@ -86,16 +86,16 @@ def check_reaches(template, n_channels, channels, binary):
     line = template.format(mask=build_mask(channels), channel=min(channels))
     run = run_ramulator([line], n_channels, binary)
     check_ran(run, line)
-    working = list_working_channels(run)
-    if working != set(channels):
+    issuing = list_issuing_channels(run)
+    if issuing != set(channels):
         raise AssertionError(
-            f"{line} on {n_channels} channels\n    did not work: {sorted(set(channels) - working)}"
-            f"\n    worked unasked: {sorted(working - set(channels))}"
+            f"{line} on {n_channels} channels\n    did not issue: {sorted(set(channels) - issuing)}"
+            f"\n    issued unasked: {sorted(issuing - set(channels))}"
         )
 
 
-def check_hex_matches_decimal(template, n_channels, binary):
-    mask = build_mask(range(n_channels))
+def check_hex_matches_decimal(template, n_channels, channels, binary):
+    mask = build_mask(channels)
     decimal = run_ramulator([template.format(mask=mask)], n_channels, binary)
     hexadecimal = run_ramulator([template.format(mask=hex(mask))], n_channels, binary)
     check_ran(decimal, template)
@@ -104,7 +104,7 @@ def check_hex_matches_decimal(template, n_channels, binary):
         raise AssertionError(f"{template} on {n_channels} channels: mask {hex(mask)} reads differently from {mask}")
 
 
-def check_system_size_is_free(template, channels, binary):
+def check_idle_channels_change_nothing(template, channels, binary):
     """`channels` cost the same and issue the same on every system in SYSTEM_SIZES."""
     line = template.format(mask=build_mask(channels), channel=min(channels))
     seen = []
@@ -114,6 +114,10 @@ def check_system_size_is_free(template, channels, binary):
         seen.append(list_channel_stats(run, channels))
     if any(stats != seen[0] for stats in seen):
         raise AssertionError(f"{line} differs between systems of {SYSTEM_SIZES} channels")
+
+
+def check_accepted(lines, n_channels, binary, overrides=()):
+    check_ran(run_ramulator(lines, n_channels, binary, overrides), lines)
 
 
 def check_refused(lines, n_channels, message, binary, overrides=()):
@@ -132,7 +136,10 @@ def check_weak_scaling_is_flat(sizes, binary):
         rows = [f"AiM MAC_ABK 63 {mask} {row}" for row in range(WEAK_ROWS_PER_CHANNEL)]
         run = run_ramulator(rows, n_channels, binary)
         check_ran(run, rows[0])
+        if list_issuing_channels(run) != set(range(n_channels)):
+            raise AssertionError(f"{n_channels} channels: not every channel issued")
         cycles[n_channels] = run.stats["memory_system_cycles"]
+    print(f"weak scaling, cycles by channel count: {cycles}")
     smallest = cycles[min(cycles)]
     if any(abs(value / smallest - 1) > WEAK_TOLERANCE for value in cycles.values()):
         raise AssertionError(f"cycles by channel count: {cycles}")
@@ -159,13 +166,18 @@ def enumerate_cases(binary):
     yield "FUNCTIONAL", "MEM write to channel 64 of 65", functools.partial(reaches, MEM_WRITE, 65, {64})
     yield (
         "FUNCTIONAL",
-        "128-channel mask in decimal and hex",
-        functools.partial(check_hex_matches_decimal, AF, 128, binary),
+        "all 128 channels in decimal and hex",
+        functools.partial(check_hex_matches_decimal, AF, 128, range(128), binary),
     )
     yield (
         "FUNCTIONAL",
-        "MAC_ABK on 0..3 of 32, 64 and 128",
-        functools.partial(check_system_size_is_free, MAC_ABK, range(4), binary),
+        "{0, 63, 127} in decimal and hex",
+        functools.partial(check_hex_matches_decimal, AF, 128, {0, 63, 127}, binary),
+    )
+    yield (
+        "FUNCTIONAL",
+        "idle channels change nothing for MAC_ABK on 0..3 of 32, 64 and 128",
+        functools.partial(check_idle_channels_change_nothing, MAC_ABK, range(4), binary),
     )
 
     for n_channels in (64, 128):
@@ -184,12 +196,24 @@ def enumerate_cases(binary):
     yield "FUNCTIONAL", "refuse mask 0", functools.partial(refused, [AF.format(mask=0)], 8, "selects no channel")
     yield (
         "FUNCTIONAL",
-        "refuse mask 1x2",
-        functools.partial(refused, [AF.format(mask="1x2")], 8, "malformed channel mask"),
+        "refuse MEM to channel -1",
+        functools.partial(refused, [MEM_WRITE.format(channel=-1)], 64, "names channel -1"),
     )
     yield (
         "FUNCTIONAL",
-        "refuse a density that does not fit 64 channels",
+        "refuse mask 1x2",
+        functools.partial(refused, [AF.format(mask="1x2")], 8, "malformed channel mask"),
+    )
+    accepted = functools.partial(check_accepted, [AF.format(mask=1)], 64, binary)
+    yield "FUNCTIONAL", "accept 64 channels, density derived", accepted
+    yield (
+        "FUNCTIONAL",
+        "accept 64 channels, density 262144",
+        functools.partial(accepted, overrides=["MemorySystem.DRAM.org.density=262144"]),
+    )
+    yield (
+        "FUNCTIONAL",
+        "refuse 64 channels, density 131072",
         functools.partial(
             refused,
             [AF.format(mask=1)],

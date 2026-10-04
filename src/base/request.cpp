@@ -24,8 +24,8 @@ std::string Request::str() {
             req_stream << "GPR0(" << GPR_addr_0 << "), ";
         if (GPR_addr_1 != -1)
             req_stream << "GPR1(" << GPR_addr_1 << "), ";
-        if (channel_mask != -1)
-            req_stream << "CHMask(" << channel_mask << "), ";
+        if (!channel_mask.empty())
+            req_stream << "CHMask(" << channel_mask.str() << "), ";
         if (bank_index != -1)
             req_stream << "BA(" << bank_index << "), ";
         if (row_addr != -1)

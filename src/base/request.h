@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "base/base.h"
+#include "base/channel_mask.h"
 
 namespace Ramulator {
 
@@ -94,10 +95,10 @@ struct Request {
     Addr_t GPR_addr_1 = -1;
 
     // This request will be broadcasted/multicasted to the channels
-    // whose bit is set in channel mask.
+    // whose bit is set in channel mask (bit i is channel i).
     // NOT USED in ISR_EWADD.
     // Channel mask must show 1 channel in ISR_WR_ABK ISR
-    int64_t channel_mask = -1;
+    ChannelMask channel_mask;
 
     // The channel a conventional R/W MEM access goes to.
     int32_t channel_id = -1;
@@ -554,15 +555,25 @@ struct ReqBuffer {
     }
 };
 
+// A field that the trace did not set is -1, or an empty mask.
+template <typename T>
+bool is_unset(const T &value) {
+    return value == (T)-1;
+}
+
+inline bool is_unset(const ChannelMask &mask) {
+    return mask.empty();
+}
+
 template <typename T>
 void AiMISR::is_field_value_legal(AiMISR::Field field, T value) {
     if (is_field_legal(field)) {
-        if (value == (T)-1) {
+        if (is_unset(value)) {
             printf("Trace: opcode %s must be provided with field %s!", AiMISRInfo::convert_AiM_opcode_to_str(opcode).c_str(), field_to_str[field].c_str());
             exit(-1);
         }
     } else {
-        if (value != (T)-1) {
+        if (!is_unset(value)) {
             printf("Trace: opcode %s does not accept field %s!", AiMISRInfo::convert_AiM_opcode_to_str(opcode).c_str(), field_to_str[field].c_str());
             exit(-1);
         }

@@ -5,6 +5,7 @@
 #include <ios>
 #include <iostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "base/exception.h"
@@ -101,7 +102,9 @@ private:
 
     template <typename T>
     T token_decoder(std::string str) {
-        if (str.compare(0, 2, "0x") == 0 | str.compare(0, 2, "0X") == 0) {
+        if constexpr (std::is_same_v<T, ChannelMask>) {
+            return ChannelMask::parse(str);
+        } else if (str.compare(0, 2, "0x") == 0 | str.compare(0, 2, "0X") == 0) {
             return std::stoll(str.substr(2), nullptr, 16);
         } else {
             return std::stoll(str);

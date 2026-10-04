@@ -17,8 +17,11 @@ public:
         {"GDDR6_16Gb_x16", {16 << 10, 16, {2, 4, 4, 1 << 14, 1 << 11}}},
         {"GDDR6_32Gb_x8", {32 << 10, 8, {2, 4, 4, 1 << 16, 1 << 11}}},
         {"GDDR6_32Gb_x16", {32 << 10, 16, {2, 4, 4, 1 << 15, 1 << 11}}},
+        // GDDR6-AiM density is aggregate device/system density, not one die's, so it scales with Ch:
+        // the per-channel geometry (4 Bg x 4 Ba x 16K Ro x 1K Co x x16) is 4 Gb, so 32 channels is 128 Gb
+        // (16 GiB), 64 is 256 Gb (32 GiB), and 128 is 512 Gb (64 GiB).
         {"GDDR6_AiM_org",
-         {128 << 10,   // density
+         {128 << 10,   // density (for Ch = 32)
           16,          // DQ (2B)
           {32,         // Ch
            4,          // Bg
@@ -549,17 +552,22 @@ private:
             m_organization.dq = *dq;
         }
 
+        bool has_count_override = false;
         for (int i = 0; i < m_levels.size(); i++) {
             auto level_name = m_levels(i);
             if (auto sz = param_group("org").param<int>(level_name).optional()) {
                 m_organization.count[i] = *sz;
+                has_count_override = true;
             }
         }
 
+        bool has_density = false;
         if (auto density = param_group("org").param<int>("density").optional()) {
             m_organization.density = *density;
+            has_density = true;
         }
 
+        // A preset's density fits only its own counts, so overriding a count without a density derives it.
         // Sanity check: is the calculated chip density the same as the provided one?
         size_t _density = size_t(m_organization.count[m_levels["channel"]]) *
                           size_t(m_organization.count[m_levels["bankgroup"]]) *
@@ -568,6 +576,9 @@ private:
                           size_t(m_organization.count[m_levels["column"]]) *
                           size_t(m_organization.dq);
         _density >>= 20;
+        if (has_count_override && !has_density) {
+            m_organization.density = _density;
+        }
         if (m_organization.density != _density) {
             throw ConfigurationError(
                 "Calculated {} chip density {} Mb does not equal the provided density {} Mb!",

@@ -24,8 +24,8 @@ std::string Request::str() {
             req_stream << "GPR0(" << GPR_addr_0 << "), ";
         if (GPR_addr_1 != -1)
             req_stream << "GPR1(" << GPR_addr_1 << "), ";
-        if (channel_mask != -1)
-            req_stream << "CHMask(" << channel_mask << "), ";
+        if (!channel_mask.empty())
+            req_stream << "CHMask(" << channel_mask.str() << "), ";
         if (bank_index != -1)
             req_stream << "BA(" << bank_index << "), ";
         if (row_addr != -1)
@@ -46,9 +46,11 @@ std::string Request::str() {
         } else {
             req_stream << "Request[Type(Unknown), Region(";
         }
-        if (mem_access_region == MemAccessRegion::MEM)
+        if (mem_access_region == MemAccessRegion::MEM) {
             req_stream << "MEM), ";
-        else if (mem_access_region == MemAccessRegion::GPR)
+            if (channel_id != -1)
+                req_stream << "CH(" << channel_id << "), ";
+        } else if (mem_access_region == MemAccessRegion::GPR)
             req_stream << "GPR), ";
         else
             req_stream << "CFR), ";

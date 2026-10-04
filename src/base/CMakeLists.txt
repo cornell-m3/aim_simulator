@@ -3,6 +3,7 @@ add_library(ramulator-base OBJECT)
 target_sources(
   ramulator-base PRIVATE
   base.h      
+  channel_mask.h
   factory.h   factory.cpp
   type.h
   exception.h

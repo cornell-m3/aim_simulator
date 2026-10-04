@@ -14,7 +14,6 @@
 namespace Ramulator {
 
 #define ISR_SIZE (1 << 21)
-#define MAX_CHANNEL_COUNT 32
 
 class AiMDRAMSystem final : public IMemorySystem, public Implementation {
     RAMULATOR_REGISTER_IMPLEMENTATION(IMemorySystem, AiMDRAMSystem, "AiMDRAM", "AiM memory system (AiM DMA).");
@@ -28,7 +27,7 @@ protected:
     std::vector<IDRAMController *> m_controllers;
     Logger_t m_logger;
     std::queue<Request> request_queue;
-    std::queue<Request> remaining_AiM_requests[MAX_CHANNEL_COUNT];
+    std::vector<std::queue<Request>> remaining_AiM_requests; // one per channel
     int AiM_req_id = 0;
 
     int stalled_AiM_requests = 0;
@@ -43,40 +42,19 @@ protected:
     std::map<CFR, int32_t> CFR_values;
     std::map<Addr_t, CFR> address_to_CFR;
 
-    uint8_t CountSetBit(const int64_t ch_mask) const {
-        assert(ch_mask > 0);
-
-        uint8_t count = 0;
-
-        for (int i = 0; i < MAX_CHANNEL_COUNT; i++)
-            if (ch_mask & (0x1 << i))
-                count++;
-
-        return count;
+    bool has_channel(int channel_id) const {
+        return (channel_id >= 0) && (channel_id < (int)m_controllers.size());
     }
 
-    uint8_t FindFirstChannelIndex(int64_t &ch_mask) const {
-        uint32_t ch_mask_u = ch_mask;
-        assert(ch_mask_u & 0xffffffff != 0);
-
-        for (int i = 0; i < MAX_CHANNEL_COUNT; i++) {
-            if (ch_mask_u & (0x1 << i)) {
-                ch_mask_u &= ~(0x1 << i);
-                ch_mask = ch_mask_u;
-                return i;
-            }
-        }
-
-        assert(false);
-        return 0;
+    [[noreturn]] void refuse_channel(int channel_id, const std::string &what) const {
+        throw ConfigurationError("AiMDRAMSystem: {} names channel {}, but the system has {} channels (set MemorySystem.DRAM.org.channel)!",
+                                 what, channel_id, m_controllers.size());
     }
 
     void apply_addr_mapp(Request &req, int channel_id) {
         req.addr_vec.resize(m_num_levels, -1);
-        if ((channel_id < 0) || (channel_id >= MAX_CHANNEL_COUNT)) {
-            m_logger->error("{} has CH more than {}!", req.str(), MAX_CHANNEL_COUNT);
-            exit(-1);
-        }
+        if (!has_channel(channel_id))
+            refuse_channel(channel_id, "a MEM access");
         req.addr_vec[m_dram->m_levels("channel")] = channel_id;
         if (m_has_rank) {
             req.addr_vec[m_dram->m_levels("rank")] = 0;
@@ -130,6 +108,8 @@ public:
             controller->m_channel_id = i;
             m_controllers.push_back(controller);
         }
+
+        remaining_AiM_requests.resize(num_channels);
 
         m_clock_ratio = param<uint>("clock_ratio").required();
 
@@ -210,7 +190,7 @@ public:
 
         bool was_AiM_request_remaining = false;
         bool is_AiM_request_remaining = false;
-        for (int channel_id = 0; channel_id < MAX_CHANNEL_COUNT; channel_id++) {
+        for (int channel_id = 0; channel_id < (int)remaining_AiM_requests.size(); channel_id++) {
             while (remaining_AiM_requests[channel_id].empty() == false) {
                 was_AiM_request_remaining = true;
                 // m_logger->info("[CLK {}] 0- Sending {} to channel {}", m_clk, remaining_AiM_requests[channel_id].front().str(), channel_id);
@@ -240,9 +220,13 @@ public:
                 case Type::AIM: {
                     Opcode opcode = host_req.opcode;
                     auto opsize = host_req.opsize;
-                    int64_t ch_mask = host_req.channel_mask;
-                    uint8_t channel_count = CountSetBit(ch_mask);
+                    const std::vector<int> channels = host_req.channel_mask.channels();
+                    if (!channels.empty() && !has_channel(channels.back())) {
+                        refuse_channel(channels.back(), fmt::format("channel mask {}", host_req.channel_mask.str()));
+                    }
                     Request aim_req = host_req;
+                    // The host request owns the mask; each per-channel request names its channel in addr_vec.
+                    aim_req.channel_mask = ChannelMask();
                     if (aim_req.opcode == Opcode::ISR_RD_SBK) {
                         aim_req.type = Type::Read;
                         aim_req.mem_access_region = MemAccessRegion::MEM;
@@ -276,8 +260,8 @@ public:
                         }
 
                         if (aim_ISR.channel_count_eq_one) {
-                            if (channel_count != 1) {
-                                throw ConfigurationError("AiMDRAMSystem: channel mask ({}) of ISR_WR_SBK must specify only 1 channel!", ch_mask);
+                            if (channels.size() != 1) {
+                                throw ConfigurationError("AiMDRAMSystem: channel mask ({}) of ISR_WR_SBK must specify only 1 channel!", host_req.channel_mask.str());
                             }
                         }
 
@@ -308,20 +292,15 @@ public:
                             host_req.col_addr = 0;
 
                         for (int i = 0; i <= opsize; i++) {
-                            int64_t channel_mask = ch_mask;
-
                             // if (aim_ISR.is_field_legal(AiMISR::Field::col_addr) == true)
                             aim_req.col_addr = host_req.col_addr + i;
 
-                            for (int cnt = 0; cnt < channel_count; cnt++) {
-                                uint8_t channel_id = FindFirstChannelIndex(channel_mask);
-
+                            for (int channel_id : channels) {
                                 aim_req.AiM_req_id = AiM_req_id++;
                                 aim_req.host_req_id = host_req.host_req_id;
                                 apply_addr_mapp(aim_req, channel_id);
                                 // m_logger->info("[CLK {}] 1- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
                                 assert(channel_id < m_controllers.size());
-                                assert(channel_id < MAX_CHANNEL_COUNT);
                                 if (m_controllers[channel_id]->send(aim_req) == false) {
                                     remaining_AiM_requests[channel_id].push(aim_req);
                                     all_AiM_requests_sent = false;
@@ -398,7 +377,7 @@ public:
                         Request aim_req = host_req;
                         // aim_req.callback = callback;
                         aim_req.AiM_req_id = AiM_req_id++;
-                        apply_addr_mapp(aim_req, aim_req.channel_mask);
+                        apply_addr_mapp(aim_req, aim_req.channel_id);
                         int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
                         // m_logger->info("[CLK {}] 4- Sending {} to channel {}", m_clk, aim_req.str(), channel_id);
                         if (m_controllers[channel_id]->send(aim_req) == false) {
@@ -433,7 +412,7 @@ public:
                     case MemAccessRegion::MEM: {
                         Request aim_req = host_req;
                         aim_req.AiM_req_id = AiM_req_id++;
-                        apply_addr_mapp(aim_req, aim_req.channel_mask);
+                        apply_addr_mapp(aim_req, aim_req.channel_id);
                         int channel_id = aim_req.addr_vec[m_dram->m_levels("channel")];
                         // m_logger->info("[CLK {}] 5- Sending {} to channel {}, channel_mask {}", m_clk, aim_req.str(), channel_id, aim_req.channel_mask);
                         if (m_controllers[channel_id]->send(aim_req) == false) {

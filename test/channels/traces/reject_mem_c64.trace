@@ -1,0 +1,3 @@
+# a MEM access to channel 64 on a 64-channel system
+W MEM 64 0 0
+AiM EOC
